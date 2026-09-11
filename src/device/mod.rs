@@ -1,6 +1,7 @@
 //! Audient device identification and, eventually, USB communication.
 
 mod catalog;
+mod control;
 mod discovery;
 mod error;
 mod protocol;
@@ -8,6 +9,7 @@ mod session;
 mod watch;
 
 pub use catalog::{AUDIENT_VENDOR_ID, DeviceModel, SUPPORTED_DEVICES, supported_device};
+pub use control::{send_headphone_level, send_speaker_level};
 pub use discovery::{
     DetectedDevice, DeviceLocation, DiscoveryReport, UnknownAudientDevice, discover,
 };

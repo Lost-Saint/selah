@@ -2,6 +2,7 @@
 
 mod app;
 pub mod device;
+mod monitor;
 
 /// Starts the Selah desktop application.
 ///
