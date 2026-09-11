@@ -14,4 +14,8 @@ Selah's initial device catalog is based on the open-source [MixiD device propert
 - Prefer a spare DFU or vendor interface so the kernel audio driver can keep streaming. Any fallback that detaches a kernel driver must restore it on every exit path.
 - Record hardware verification with the exact interface model and relevant firmware version.
 
+## Discovery
+
+Selah currently enumerates USB descriptors and filters them by Audient's vendor ID. Discovery does not open the device, claim a USB interface, or detach a kernel driver. Known product IDs are matched to the static catalog; unknown Audient product IDs remain visible to the UI as unsupported devices.
+
 Control requests have not been ported yet. Add verified request details here as the Rust transport is implemented; do not infer support from the C++ reference compiling or from a device being present in the catalog.
