@@ -11,5 +11,7 @@ pub use discovery::{
     DetectedDevice, DeviceLocation, DiscoveryReport, UnknownAudientDevice, discover,
 };
 pub use error::DiscoveryError;
-pub use session::{ControlInterface, ControlInterfaceKind, DeviceSession, SessionError};
+pub use session::{
+    ControlInterface, ControlInterfaceKind, DeviceSession, SessionError, SessionErrorKind,
+};
 pub use watch::{DeviceWatchEvent, watch_events};

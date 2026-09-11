@@ -58,7 +58,7 @@ The app does not open a device session yet, no mixer control request has been se
 - Inspect USB interfaces and prefer the spare DFU or vendor interface identified by [MixiD issue #15](https://github.com/TheOnlyJoey/MixiD/issues/15).
 - Give the device session one owner with deterministic claim, release, and shutdown behavior.
 - Keep device I/O serialized and away from Iced's UI thread.
-- Distinguish permission denied, device busy, disconnected, and unsupported-interface errors.
+- Distinguish permission denied, device busy, disconnected, and unsupported-interface errors. ✅
 - Introduce a mockable transport boundary and test acquisition and cleanup failures.
 - Send one harmless, bounded control request on the maintainer's first test model.
 

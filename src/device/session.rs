@@ -156,25 +156,55 @@ pub enum SessionError {
     Release { interface: u8, source: nusb::Error },
 }
 
+/// Stable error categories callers can use without depending on `nusb` details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionErrorKind {
+    PermissionDenied,
+    Busy,
+    Disconnected,
+    UnsupportedInterface,
+    Other,
+}
+
 impl SessionError {
+    /// Returns the actionable category for this failure.
+    #[must_use]
+    pub fn kind(&self) -> SessionErrorKind {
+        match self {
+            Self::NotFound { .. } => SessionErrorKind::Disconnected,
+            Self::NoSafeControlInterface { .. } => SessionErrorKind::UnsupportedInterface,
+            Self::Enumerate(source)
+            | Self::Open(source)
+            | Self::Claim { source, .. }
+            | Self::Release { source, .. } => classify_nusb_error(source.kind()),
+        }
+    }
+
     /// Gives the user a useful next step for this class of error.
     #[must_use]
     pub fn recovery_hint(&self) -> &'static str {
-        match self {
-            Self::NotFound { .. } => "Reconnect the interface and scan again.",
-            Self::NoSafeControlInterface { .. } => {
+        match self.kind() {
+            SessionErrorKind::Disconnected => "Reconnect the interface and scan again.",
+            SessionErrorKind::UnsupportedInterface => {
                 "Selah will not claim an audio interface. This model needs hardware investigation."
             }
-            Self::Open(source) | Self::Enumerate(source)
-                if source.kind() == nusb::ErrorKind::PermissionDenied =>
-            {
+            SessionErrorKind::PermissionDenied => {
                 "Install the Selah udev rule, reconnect the interface, and try again."
             }
-            Self::Claim { source, .. } if source.kind() == nusb::ErrorKind::Busy => {
+            SessionErrorKind::Busy => {
                 "Another process owns the control interface. Close it and try again."
             }
-            _ => "Reconnect the interface and try again.",
+            SessionErrorKind::Other => "Reconnect the interface and try again.",
         }
+    }
+}
+
+fn classify_nusb_error(kind: nusb::ErrorKind) -> SessionErrorKind {
+    match kind {
+        nusb::ErrorKind::PermissionDenied => SessionErrorKind::PermissionDenied,
+        nusb::ErrorKind::Busy => SessionErrorKind::Busy,
+        nusb::ErrorKind::Disconnected | nusb::ErrorKind::NotFound => SessionErrorKind::Disconnected,
+        _ => SessionErrorKind::Other,
     }
 }
 
@@ -249,7 +279,34 @@ pub(crate) fn select_control_interface(
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlInterface, ControlInterfaceKind, select_control_interface};
+    use super::{
+        ControlInterface, ControlInterfaceKind, SessionErrorKind, classify_nusb_error,
+        select_control_interface,
+    };
+
+    #[test]
+    fn classifies_actionable_usb_errors() {
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::PermissionDenied),
+            SessionErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::Busy),
+            SessionErrorKind::Busy
+        );
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::Disconnected),
+            SessionErrorKind::Disconnected
+        );
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::NotFound),
+            SessionErrorKind::Disconnected
+        );
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::Other),
+            SessionErrorKind::Other
+        );
+    }
 
     #[test]
     fn opening_requires_the_selected_attachment_and_model() {
