@@ -6,7 +6,7 @@ Selah is not ready to control hardware yet. The current application provides the
 
 ## Requirements
 
-- Rust 1.88 or newer, installed with [rustup](https://rustup.rs/)
+- The latest stable Rust toolchain, installed with [rustup](https://rustup.rs/)
 - Linux development packages required by Iced's windowing backend
 - An Audient iD interface for hardware testing; unit tests do not require one
 
