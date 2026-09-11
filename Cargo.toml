@@ -6,6 +6,7 @@ description = "Linux control panel for Audient iD audio interfaces"
 publish = false
 
 [dependencies]
+futures-core = "0.3"
 iced = { version = "0.14", features = ["canvas", "tokio"] }
 nusb = { version = "0.2", features = ["tokio"] }
 tracing = "0.1"

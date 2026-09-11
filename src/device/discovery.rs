@@ -4,9 +4,26 @@ use super::{AUDIENT_VENDOR_ID, ControlInterface, DeviceModel, DiscoveryError, su
 /// A recognized Audient interface found during discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetectedDevice {
+    pub location: DeviceLocation,
     pub model: &'static DeviceModel,
     pub reported_name: Option<String>,
     pub control_interface: Option<ControlInterface>,
+}
+
+/// USB location for the current attachment, not a persistent device identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceLocation {
+    pub bus: String,
+    pub address: u8,
+}
+
+impl DeviceLocation {
+    pub(crate) fn from_info(info: &nusb::DeviceInfo) -> Self {
+        Self {
+            bus: info.bus_id().to_owned(),
+            address: info.device_address(),
+        }
+    }
 }
 
 /// An Audient interface whose product ID is not in Selah's catalog.
@@ -35,6 +52,7 @@ pub async fn discover() -> Result<DiscoveryReport, DiscoveryError> {
 
     Ok(DiscoveryReport::from_identities(devices.map(|device| {
         DeviceIdentity {
+            location: DeviceLocation::from_info(&device),
             vendor_id: device.vendor_id(),
             product_id: device.product_id(),
             reported_name: device.product_string().map(str::to_owned),
@@ -48,6 +66,7 @@ pub async fn discover() -> Result<DiscoveryReport, DiscoveryError> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeviceIdentity {
+    location: DeviceLocation,
     vendor_id: u16,
     product_id: u16,
     reported_name: Option<String>,
@@ -65,6 +84,7 @@ impl DiscoveryReport {
 
             if let Some(model) = supported_device(device.product_id) {
                 report.supported.push(DetectedDevice {
+                    location: device.location,
                     model,
                     reported_name: device.reported_name,
                     control_interface: select_control_interface(device.interfaces),
@@ -83,7 +103,7 @@ impl DiscoveryReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIENT_VENDOR_ID, DeviceIdentity, DiscoveryReport};
+    use super::{AUDIENT_VENDOR_ID, DeviceIdentity, DeviceLocation, DiscoveryReport};
 
     #[test]
     fn ignores_devices_from_other_vendors() {
@@ -132,6 +152,10 @@ mod tests {
         interfaces: &[(u8, u8)],
     ) -> DeviceIdentity {
         DeviceIdentity {
+            location: DeviceLocation {
+                bus: "1".to_owned(),
+                address: 2,
+            },
             vendor_id,
             product_id,
             reported_name: reported_name.map(str::to_owned),

@@ -2610,6 +2610,7 @@ dependencies = [
 name = "selah"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "iced",
  "nusb",
  "tracing",

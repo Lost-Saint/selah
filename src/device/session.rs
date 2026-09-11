@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use super::{AUDIENT_VENDOR_ID, DeviceModel};
+use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xff;
@@ -49,14 +49,20 @@ impl DeviceSession {
     ///
     /// Returns a typed error if enumeration, opening, or claiming fails, or if
     /// the device has no safe control interface.
-    pub async fn open(model: &'static DeviceModel) -> Result<Self, SessionError> {
+    pub async fn open(selected: &DetectedDevice) -> Result<Self, SessionError> {
+        let model = selected.model;
         let mut devices = nusb::list_devices()
             .await
             .map_err(SessionError::Enumerate)?;
 
         let info = devices
             .find(|device| {
-                device.vendor_id() == AUDIENT_VENDOR_ID && device.product_id() == model.product_id
+                matches_selection(
+                    selected,
+                    &DeviceLocation::from_info(device),
+                    device.vendor_id(),
+                    device.product_id(),
+                )
             })
             .ok_or(SessionError::NotFound {
                 product_id: model.product_id,
@@ -116,6 +122,17 @@ impl DeviceSession {
                 source,
             })
     }
+}
+
+fn matches_selection(
+    selected: &DetectedDevice,
+    location: &DeviceLocation,
+    vendor_id: u16,
+    product_id: u16,
+) -> bool {
+    selected.location == *location
+        && vendor_id == AUDIENT_VENDOR_ID
+        && product_id == selected.model.product_id
 }
 
 impl std::fmt::Debug for DeviceSession {
@@ -233,6 +250,54 @@ pub(crate) fn select_control_interface(
 #[cfg(test)]
 mod tests {
     use super::{ControlInterface, ControlInterfaceKind, select_control_interface};
+
+    #[test]
+    fn opening_requires_the_selected_attachment_and_model() {
+        use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, matches_selection};
+        let location = DeviceLocation {
+            bus: "1".to_owned(),
+            address: 2,
+        };
+        let selected = DetectedDevice {
+            location: location.clone(),
+            model: crate::device::supported_device(0x000d).unwrap(),
+            reported_name: None,
+            control_interface: None,
+        };
+        assert!(matches_selection(
+            &selected,
+            &location,
+            AUDIENT_VENDOR_ID,
+            0x000d
+        ));
+        let other_address = DeviceLocation {
+            address: 3,
+            ..location.clone()
+        };
+        let other_bus = DeviceLocation {
+            bus: "2".to_owned(),
+            ..location.clone()
+        };
+        assert!(!matches_selection(
+            &selected,
+            &other_address,
+            AUDIENT_VENDOR_ID,
+            0x000d
+        ));
+        assert!(!matches_selection(
+            &selected,
+            &other_bus,
+            AUDIENT_VENDOR_ID,
+            0x000d
+        ));
+        assert!(!matches_selection(&selected, &location, 0x1234, 0x000d));
+        assert!(!matches_selection(
+            &selected,
+            &location,
+            AUDIENT_VENDOR_ID,
+            0x0008
+        ));
+    }
 
     #[test]
     fn prefers_application_specific_interface() {

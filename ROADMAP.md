@@ -41,6 +41,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - asynchronous USB descriptor discovery;
 - recognized, unsupported, absent, scanning, and failure states;
 - manual rescan without opening or claiming the device;
+- event-driven refresh when USB devices connect or disconnect;
 - safe control-interface detection that prefers application/DFU interfaces and refuses audio interfaces;
 - an explicit device-session primitive that opens and claims only a safe control interface, with drop-based and awaited release paths;
 - hardware-independent catalog and discovery tests;
@@ -53,7 +54,7 @@ The app does not open a device session yet, no mixer control request has been se
 
 **Outcome:** Selah can establish and close a control session on one physical interface without interrupting Linux audio.
 
-- Detect hot-plug and removal instead of relying only on manual scans.
+- Detect hot-plug and removal instead of relying only on manual scans. ✅
 - Inspect USB interfaces and prefer the spare DFU or vendor interface identified by [MixiD issue #15](https://github.com/TheOnlyJoey/MixiD/issues/15).
 - Give the device session one owner with deterministic claim, release, and shutdown behavior.
 - Keep device I/O serialized and away from Iced's UI thread.

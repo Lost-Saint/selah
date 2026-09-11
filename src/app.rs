@@ -1,15 +1,21 @@
 use iced::widget::{button, column, container, row, space, text};
-use iced::{Alignment, Element, Fill, Length, Task, Theme};
+use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 
-use crate::device::{DiscoveryError, DiscoveryReport, UnknownAudientDevice, discover};
+use crate::device::{
+    DeviceWatchEvent, DiscoveryError, DiscoveryReport, UnknownAudientDevice, discover, watch_events,
+};
 
 struct App {
     status: DeviceStatus,
+    scan_in_flight: bool,
+    rescan_requested: bool,
+    watch_status: WatchStatus,
 }
 
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
+    DeviceWatch(DeviceWatchEvent),
     DiscoveryFinished(Result<DiscoveryReport, DiscoveryError>),
 }
 
@@ -21,10 +27,17 @@ enum DeviceStatus {
     Failed(DiscoveryError),
 }
 
+enum WatchStatus {
+    Starting,
+    Active,
+    Failed,
+}
+
 pub(crate) fn run() -> iced::Result {
     iced::application(App::new, update, view)
         .title("Selah")
         .theme(theme)
+        .subscription(subscription)
         .window_size((760.0, 520.0))
         .centered()
         .run()
@@ -35,19 +48,30 @@ impl App {
         (
             Self {
                 status: DeviceStatus::Scanning,
+                scan_in_flight: false,
+                rescan_requested: false,
+                watch_status: WatchStatus::Starting,
             },
-            discovery_task(),
+            Task::none(),
         )
     }
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::Refresh if !matches!(app.status, DeviceStatus::Scanning) => {
-            app.status = DeviceStatus::Scanning;
-            discovery_task()
+        Message::DeviceWatch(DeviceWatchEvent::Started) => {
+            tracing::info!("Watching for USB device changes");
+            app.watch_status = WatchStatus::Active;
+            request_scan(app)
         }
-        Message::Refresh => Task::none(),
+        Message::Refresh | Message::DeviceWatch(DeviceWatchEvent::DevicesChanged) => {
+            request_scan(app)
+        }
+        Message::DeviceWatch(DeviceWatchEvent::Failed(error)) => {
+            tracing::warn!(%error, "Automatic USB device detection is unavailable");
+            app.watch_status = WatchStatus::Failed;
+            request_scan(app)
+        }
         Message::DiscoveryFinished(Ok(report)) if !report.supported.is_empty() => {
             tracing::info!(
                 supported = report.supported.len(),
@@ -55,7 +79,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 "Audient device scan completed"
             );
             app.status = DeviceStatus::Ready(report);
-            Task::none()
+            finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
             tracing::warn!(
@@ -63,18 +87,39 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 "Found an unrecognized Audient interface"
             );
             app.status = DeviceStatus::Unsupported(report);
-            Task::none()
+            finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(_)) => {
             tracing::info!("No Audient interface detected");
             app.status = DeviceStatus::Empty;
-            Task::none()
+            finish_scan(app)
         }
         Message::DiscoveryFinished(Err(error)) => {
             tracing::error!(%error, "Audient device scan failed");
             app.status = DeviceStatus::Failed(error);
-            Task::none()
+            finish_scan(app)
         }
+    }
+}
+
+fn request_scan(app: &mut App) -> Task<Message> {
+    if app.scan_in_flight {
+        app.rescan_requested = true;
+        return Task::none();
+    }
+
+    app.scan_in_flight = true;
+    app.status = DeviceStatus::Scanning;
+    discovery_task()
+}
+
+fn finish_scan(app: &mut App) -> Task<Message> {
+    app.scan_in_flight = false;
+
+    if std::mem::take(&mut app.rescan_requested) {
+        request_scan(app)
+    } else {
+        Task::none()
     }
 }
 
@@ -82,12 +127,16 @@ fn discovery_task() -> Task<Message> {
     Task::perform(discover(), Message::DiscoveryFinished)
 }
 
+fn subscription(_app: &App) -> Subscription<Message> {
+    Subscription::run(watch_events).map(Message::DeviceWatch)
+}
+
 fn theme(_app: &App) -> Theme {
     Theme::Dark
 }
 
 fn view(app: &App) -> Element<'_, Message> {
-    let scanning = matches!(app.status, DeviceStatus::Scanning);
+    let scanning = app.scan_in_flight;
     let refresh = button(text(if scanning {
         "Scanning…"
     } else {
@@ -119,9 +168,7 @@ fn view(app: &App) -> Element<'_, Message> {
             .padding(28)
             .style(container::rounded_box),
         row![
-            text("Audient USB vendor 2708")
-                .size(13)
-                .style(text::secondary),
+            text(watch_status(app)).size(13).style(text::secondary),
             space().width(Length::Fill),
             refresh,
         ]
@@ -132,6 +179,14 @@ fn view(app: &App) -> Element<'_, Message> {
     .max_width(680);
 
     container(content).center(Fill).padding(40).into()
+}
+
+fn watch_status(app: &App) -> &'static str {
+    match app.watch_status {
+        WatchStatus::Starting => "Starting automatic USB detection",
+        WatchStatus::Active => "Watching for USB connection changes",
+        WatchStatus::Failed => "Automatic detection unavailable — use Scan again",
+    }
 }
 
 fn status_view(status: &DeviceStatus) -> Element<'_, Message> {
@@ -251,5 +306,30 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
         0 => None,
         1 => Some("1 additional Audient interface was found.".to_owned()),
         count => Some(format!("{count} additional Audient interfaces were found.")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, finish_scan, request_scan};
+
+    #[test]
+    fn scan_requests_are_coalesced_while_a_scan_is_running() {
+        let (mut app, _startup) = App::new();
+
+        let _first_scan = request_scan(&mut app);
+        let _queued_scan = request_scan(&mut app);
+        let _duplicate_scan = request_scan(&mut app);
+
+        assert!(app.scan_in_flight);
+        assert!(app.rescan_requested);
+
+        let _restart = finish_scan(&mut app);
+        assert!(app.scan_in_flight);
+        assert!(!app.rescan_requested);
+
+        let _finished = finish_scan(&mut app);
+        assert!(!app.scan_in_flight);
+        assert!(!app.rescan_requested);
     }
 }
