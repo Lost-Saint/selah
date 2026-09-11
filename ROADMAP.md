@@ -48,7 +48,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app does not open a device session yet, no mixer control request has been sent from Selah, and no model has been physically verified in Selah.
+The app does not open a device session yet and no mixer control request has been sent from Selah. A safe claim-and-release cycle has been physically verified on an iD14 MKII without disturbing its Linux audio interfaces; broader connect, disconnect, shutdown, and failure testing is still required.
 
 ## Milestone 1 — Safe device session
 
@@ -157,6 +157,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The next target is **Milestone 1: Safe device session**. Before sending a control request, we need to choose the first physical Audient model used for verification. That model becomes the initial reference device; the architecture must still remain capability-driven and avoid baking in its channel layout.
+The current target is **Milestone 1: Safe device session**, using the iD14 MKII as the initial reference device. The architecture must remain capability-driven and avoid baking in its channel layout. The next software boundary is serialized device I/O; any state-changing control request remains an explicit hardware-verification step.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.

@@ -30,6 +30,14 @@ cargo test --all-features
 
 `Cargo.lock` is intentionally committed because Selah is an application.
 
+The physical session check is ignored during normal test runs because it claims a USB interface. Run it only for a connected device whose four-digit product ID you have verified:
+
+```sh
+SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored --exact opens_and_closes_selected_safe_interface
+```
+
+This check claims and releases only the discovered non-audio control interface. It does not send a mixer control payload. Never run it as root.
+
 ## USB permissions
 
 Do not run Selah as root. A sample udev rule is available at [`resources/udev/70-selah.rules`](resources/udev/70-selah.rules). Review it, install it using your distribution's normal process, then reload udev rules and reconnect the interface.

@@ -14,6 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 futures-lite = "2"
+tokio = { version = "1", features = ["rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

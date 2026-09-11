@@ -21,3 +21,11 @@ Selah currently enumerates USB descriptors and filters them by Audient's vendor 
 For known devices, discovery also looks for an application-specific (`0xfe`) or vendor-specific (`0xff`) USB interface. A device session may claim one of those interfaces without detaching a kernel driver. Selah intentionally refuses to fall back to an audio-class interface until that behavior can be designed and verified safely.
 
 Control requests have not been ported yet. Add verified request details here as the Rust transport is implemented; do not infer support from the C++ reference compiling or from a device being present in the catalog.
+
+## Hardware verification
+
+| Date | Model | USB identity | Verification | Result |
+| --- | --- | --- | --- | --- |
+| 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Claim and release application interface 4 without sending a control payload | Passed; audio interfaces 0–2 remained bound to `snd-usb-audio`, and PipeWire and ALSA still exposed playback and capture afterward |
+
+The device release comes from the USB descriptor and is not confirmed to be the user-facing firmware version.

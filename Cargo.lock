@@ -2614,6 +2614,7 @@ dependencies = [
  "futures-lite",
  "iced",
  "nusb",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
