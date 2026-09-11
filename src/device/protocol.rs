@@ -4,10 +4,14 @@ use std::fmt::{self, Display, Formatter};
 const SET_CURRENT: u8 = 0x01;
 const SPEAKER_VOLUME_CONTROL: u16 = 0x1200;
 const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
-// MixiD `set_hp_volume` (driver.h) sends the same level twice, once per
-// headphone channel, against output entity `0x0a`.
+// Headphone volume lives on feature unit `0x0c`, which carries four output
+// channels: 1 and 2 are the monitor pair, 3 and 4 the headphones. `MixiD`
+// `set_hp_volume` (driver.h) addressed entity `0x0a` instead, but that
+// entity declares no controls at all so those writes went nowhere; the BiD
+// fork corrected the entity to `0x0c` and verified it against descriptors
+// (see docs/protocol.md).
 const HEADPHONE_VOLUME_CONTROLS: [u16; 2] = [0x0203, 0x0204];
-const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0a00;
+const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0c00;
 
 /// A finite mixer level between silence (`0.0`) and full scale (`1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,8 +72,9 @@ pub(crate) fn speaker_volume(level: NormalizedLevel, interface_number: u8) -> Co
 /// Encodes headphone volume as the two channel requests `MixiD` sends.
 ///
 /// `MixiD` `set_hp_volume` (driver.h) writes the same level to controls
-/// `0x0203` and `0x0204` against output entity `0x0a`; both transfers must
-/// succeed for the left and right channels to stay matched.
+/// `0x0203` and `0x0204` — selector `0x02`, channels 3 and 4, the headphone
+/// pair of feature unit `0x0c`. Both transfers must succeed for the left
+/// and right channels to stay matched.
 pub(crate) fn headphone_volume(
     level: NormalizedLevel,
     interface_number: u8,
@@ -122,13 +127,13 @@ mod tests {
                 ControlRequest {
                     request: 0x01,
                     value: 0x0203,
-                    index: 0x0a04,
+                    index: 0x0c04,
                     payload: vec![0x00, 0x80],
                 },
                 ControlRequest {
                     request: 0x01,
                     value: 0x0204,
-                    index: 0x0a04,
+                    index: 0x0c04,
                     payload: vec![0x00, 0x80],
                 },
             ]

@@ -34,13 +34,17 @@ Treat this mapping as reference-derived until the audible change is confirmed on
 
 ### Reference-derived headphone volume
 
-MixiD `set_hp_volume` (driver.h) sends the headphone level twice — controls `0x0203` and `0x0204` against output entity `0x0a` — with the same two-byte little-endian signed mapping (`0.0..=1.0` to `-32768..=-1`). Selah encodes both transfers as pure data, validates the input range, and sends them in order on one session so a first-transfer failure is reported instead of leaving the channels mismatched. The UI slider sends them through a background task that opens a safe session, sends both bounded requests, and closes the session; the slider position is the last requested level, and the status line reports only what was sent, since Selah cannot read the level back. The opt-in hardware check `sends_harmless_headphone_volume_request` exercises the same path with level `0.1`:
+Headphone volume lives on feature unit `0x0c`: selector `0x02`, channels 3 and 4 (channels 1 and 2 are the monitor pair). Selah sends the level to controls `0x0203` and `0x0204` with the same two-byte little-endian signed mapping (`0.0..=1.0` to `-32768..=-1`), in order on one session so a first-transfer failure is reported instead of leaving the channels mismatched.
+
+Cautionary history: MixiD `set_hp_volume` (driver.h) used the same controls but against output entity `0x0a`, and Selah initially reproduced that mapping. The [BiD fork](https://github.com/baakhoff/BiD) found that entity `0x0a` declares no controls at all — those writes are accepted by USB and do nothing audible — and corrected the entity to `0x0c`, matching the unit and channel counts read from real iD14 MKII descriptors (see its `docs/PROTOCOL.md`, "What an iD14 MKII's descriptors say"). Transfer acceptance alone therefore proves nothing for this control; only a listening test counts.
+
+The UI slider sends both bounded requests through a background task that opens a safe session, sends, and closes the session; the slider position is the last requested level, and the status line reports only what was sent, since Selah cannot read the level back. The opt-in hardware check `sends_harmless_headphone_volume_request` exercises the same path with level `0.1`:
 
 ```sh
 SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored --exact sends_harmless_headphone_volume_request
 ```
 
-Treat this mapping as reference-derived until the audible change is confirmed on headphones. It sets the headphone level; run it only when that is safe for the connected setup.
+Treat this mapping as reference-derived until the audible change is confirmed on headphones. It sets the headphone level; run it only when that is safe for the connected setup. One known limitation from BiD's measurements: on a cue-fed phones output the `0x0c` headphone gain made no audible difference, and the Main-Mix-fed case is untested there — so audibility may also depend on what the phones output is currently routed to, which Selah cannot see yet.
 
 ## Hardware verification
 
@@ -51,5 +55,6 @@ Treat this mapping as reference-derived until the audible change is confirmed on
 | 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | 5 back-to-back passes of claim/release plus speaker-volume `0.1`, then a busy-interface probe (raw holder claim, Selah open must fail `Busy` with recovery hint, then open/close recovery) | Passed; 10/10 session cycles and the Busy kind, hint, and recovery open/close all succeeded. Audio interfaces 0–2 stayed bound to `snd-usb-audio` and PipeWire kept exposing playback and capture throughout |
 | 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Maintainer-reported: quit the Selah app while connected, then physical unplug/replug with the app running | Passed; PipeWire playback and capture kept working, and Selah picked the device back up after the replug. Agent-corroborated after the fact: device re-enumerated, interfaces 0–2 bound to `snd-usb-audio`, PipeWire still exposing the iD14 |
 | 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Send headphone volume `0.1` via `sends_harmless_headphone_volume_request`, once plus 5 back-to-back repeats | Passed transfer 6/6; audio interfaces 0–2 remained bound to `snd-usb-audio`, and the PipeWire Headphones sink stayed `RUNNING` with the same active stream throughout. Audible level change unconfirmed — the agent has no way to hear the output; needs maintainer corroboration |
+| 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Listening tests against the corrected `0x0c` headphone entity: send `0.1` then `1.0` while audio played, then drag the speaker slider to `0%` while listening on headphones | Both `0x0c` sends transferred cleanly with audio intact, but neither produced any audible change, and the speaker slider left the headphones unchanged too. Conclusion: this setup's phones are routed to a fixed-level feed (cue or DAW-thru), not Main Mix — so neither the `0x0c` headphone gain nor the `0x36` monitor control can bite until the phones are routed to Main Mix (Milestone 4 scope). Matches BiD's finding that `0x0c` ch3/4 is inaudible on cue-fed phones |
 
 The device release comes from the USB descriptor and is not confirmed to be the user-facing firmware version.

@@ -64,10 +64,16 @@ async fn check_speaker_volume() {
 async fn check_headphone_volume() {
     let selected = select_single_device().await;
 
+    // Optional exact level for listening tests; defaults to the harmless 0.1.
+    let level = std::env::var("SELAH_HARDWARE_LEVEL")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.1);
+    let level = NormalizedLevel::new(level).expect("probe level must be 0.0..=1.0");
+
     let mut session = DeviceSession::open(&selected)
         .await
         .expect("safe session should open");
-    let level = NormalizedLevel::new(0.1).expect("0.1 is a valid mixer level");
     session
         .set_headphone_level(level)
         .await
