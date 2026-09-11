@@ -408,7 +408,7 @@ mod tests {
 
     use super::{
         AcquiredInterface, ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation,
-        SessionErrorKind, SessionOwner, SessionTransport, classify_nusb_error,
+        SessionError, SessionErrorKind, SessionOwner, SessionTransport, classify_nusb_error,
         select_control_interface,
     };
     use crate::device::protocol::ControlRequest;
@@ -426,6 +426,9 @@ mod tests {
         releases: usize,
         handles_dropped: usize,
         sends: usize,
+        /// Handles acquired but neither released nor dropped. Any test
+        /// ending with this above zero has left a session claimed.
+        live_handles: usize,
     }
 
     struct MockTransport {
@@ -433,13 +436,18 @@ mod tests {
         acquire_error: bool,
         release_error: bool,
         send_error: bool,
+        /// When set, only the first this many acquisitions succeed and the
+        /// rest fail, simulating a disconnect partway through a cycle run.
+        fail_acquire_after: Option<usize>,
     }
 
     struct MockHandle(Arc<Mutex<MockState>>);
 
     impl Drop for MockHandle {
         fn drop(&mut self) {
-            self.0.lock().unwrap().handles_dropped += 1;
+            let mut state = self.0.lock().unwrap();
+            state.handles_dropped += 1;
+            state.live_handles -= 1;
         }
     }
 
@@ -455,12 +463,16 @@ mod tests {
             &self,
             _selected: &DetectedDevice,
         ) -> Result<AcquiredInterface<Self::Handle>, Self::Error> {
-            self.state.lock().unwrap().acquisitions += 1;
+            let mut state = self.state.lock().unwrap();
+            state.acquisitions += 1;
 
-            if self.acquire_error {
+            let exhausted = self.acquire_error
+                || matches!(self.fail_acquire_after, Some(limit) if state.acquisitions > limit);
+            if exhausted {
                 return Err(MockError::Acquire);
             }
 
+            state.live_handles += 1;
             Ok(AcquiredInterface {
                 control: ControlInterface {
                     number: 4,
@@ -599,6 +611,175 @@ mod tests {
         assert_eq!(state.releases, 0);
     }
 
+    #[test]
+    fn rapid_connect_disconnect_cycles_leave_nothing_outstanding() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+
+        for _ in 0..25 {
+            let mut owner = block_on(SessionOwner::open(
+                mock_transport(&state, false, false),
+                &selected_device(),
+            ))
+            .unwrap();
+            assert_eq!(block_on(owner.send(&volume_request())), Ok(()));
+            assert_eq!(block_on(owner.close()), Ok(()));
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.acquisitions, 25);
+        assert_eq!(state.sends, 25);
+        assert_eq!(state.releases, 25);
+        assert_eq!(state.handles_dropped, 25);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
+    fn disconnect_midway_through_cycles_stops_without_leaking() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+
+        for _ in 0..6 {
+            let opened = block_on(SessionOwner::open(
+                mock_transport_failing_acquire_after(&state, 2),
+                &selected_device(),
+            ));
+            match opened {
+                Ok(owner) => {
+                    assert_eq!(block_on(owner.close()), Ok(()));
+                }
+                Err(error) => assert_eq!(error, MockError::Acquire),
+            }
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.acquisitions, 6);
+        assert_eq!(state.releases, 2);
+        assert_eq!(state.handles_dropped, 2);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
+    fn disconnect_during_request_keeps_the_session_closeable() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport_with_send_error(&state, true),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        // A failed send borrows the session, so the handle is retained and
+        // the interface can still be released with an explicit close.
+        assert_eq!(
+            block_on(owner.send(&volume_request())),
+            Err(MockError::Send)
+        );
+        assert_eq!(block_on(owner.close()), Ok(()));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sends, 1);
+        assert_eq!(state.releases, 1);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
+    fn shutdown_without_close_still_drops_the_handle() {
+        // Simulates app shutdown while work is pending: the owner is dropped
+        // without an awaited close. No explicit release runs here; the real
+        // transport relies on nusb releasing the claim when the last
+        // interface handle is dropped, which only hardware can fully verify.
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport(&state, false, false),
+            &selected_device(),
+        ))
+        .unwrap();
+        assert_eq!(block_on(owner.send(&volume_request())), Ok(()));
+        drop(owner);
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sends, 1);
+        assert_eq!(state.releases, 0);
+        assert_eq!(state.handles_dropped, 1);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
+    fn mixed_close_and_drop_cycles_leave_nothing_outstanding() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+
+        for cycle in 0..10 {
+            let owner = block_on(SessionOwner::open(
+                mock_transport(&state, false, false),
+                &selected_device(),
+            ))
+            .unwrap();
+            if cycle % 2 == 0 {
+                assert_eq!(block_on(owner.close()), Ok(()));
+            } else {
+                drop(owner);
+            }
+        }
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.acquisitions, 10);
+        assert_eq!(state.releases, 5);
+        assert_eq!(state.handles_dropped, 10);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
+    fn session_failures_map_to_actionable_kinds_and_hints() {
+        use nusb::transfer::TransferError;
+
+        // Constructible without hardware: these carry no nusb::Error payload.
+        let cases = [
+            (
+                SessionError::NotFound { product_id: 0x0008 },
+                SessionErrorKind::Disconnected,
+                "Reconnect",
+            ),
+            (
+                SessionError::NoSafeControlInterface { product_id: 0x0008 },
+                SessionErrorKind::UnsupportedInterface,
+                "audio interface",
+            ),
+            (
+                SessionError::Transfer(TransferError::Disconnected),
+                SessionErrorKind::Disconnected,
+                "Reconnect",
+            ),
+            (
+                SessionError::Transfer(TransferError::Cancelled),
+                SessionErrorKind::Other,
+                "Reconnect",
+            ),
+            (
+                SessionError::Transfer(TransferError::Stall),
+                SessionErrorKind::Other,
+                "Reconnect",
+            ),
+        ];
+
+        for (error, kind, hint_contains) in cases {
+            assert_eq!(error.kind(), kind);
+            assert!(
+                error.recovery_hint().contains(hint_contains),
+                "hint for {kind:?} should tell the user what to do next"
+            );
+        }
+
+        // nusb::Error is not constructible outside nusb, so the
+        // open/claim/release dispatch onto these categories is covered
+        // through the public ErrorKind mapping instead of end to end.
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::PermissionDenied),
+            SessionErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            classify_nusb_error(nusb::ErrorKind::Busy),
+            SessionErrorKind::Busy
+        );
+    }
+
     fn mock_transport(
         state: &Arc<Mutex<MockState>>,
         acquire_error: bool,
@@ -609,6 +790,7 @@ mod tests {
             acquire_error,
             release_error,
             send_error: false,
+            fail_acquire_after: None,
         }
     }
 
@@ -621,7 +803,28 @@ mod tests {
             acquire_error: false,
             release_error: false,
             send_error,
+            fail_acquire_after: None,
         }
+    }
+
+    fn mock_transport_failing_acquire_after(
+        state: &Arc<Mutex<MockState>>,
+        succeed_first: usize,
+    ) -> MockTransport {
+        MockTransport {
+            state: Arc::clone(state),
+            acquire_error: false,
+            release_error: false,
+            send_error: false,
+            fail_acquire_after: Some(succeed_first),
+        }
+    }
+
+    fn volume_request() -> ControlRequest {
+        use crate::device::NormalizedLevel;
+        use crate::device::protocol::speaker_volume;
+
+        speaker_volume(NormalizedLevel::new(0.5).unwrap(), 4)
     }
 
     fn selected_device() -> DetectedDevice {
