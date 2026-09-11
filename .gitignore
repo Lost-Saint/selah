@@ -1,1 +1,9 @@
-/target
+/target/
+
+# Local configuration, logs, and editor state
+/.env
+/.idea/
+/.vscode/
+*.log
+*.swp
+*~

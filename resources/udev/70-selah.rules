@@ -1,0 +1,2 @@
+# Audient USB interfaces: grant the locally logged-in user device access.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2708", TAG+="uaccess"
