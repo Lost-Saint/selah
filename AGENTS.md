@@ -139,6 +139,7 @@ cargo test --all-features --locked
 Most code changes do not need new documentation. Agents can read types, tests, and local comments.
 
 - `README.md` helps users install, run, and understand the current maturity of Selah. Keep it honest and concise.
+- `ROADMAP.md` holds public product outcomes and milestone exit conditions. Keep task-level implementation notes in the issue that owns the work.
 - `docs/protocol.md` holds durable protocol findings, their sources, uncertainty, and physical verification status.
 - Add a nearby code comment when reasoning is local to one request, conversion, or cleanup path.
 - Use a deeper internal document only when a decision crosses the app, protocol, and transport boundaries or records a trap that is difficult to discover from code.
@@ -183,6 +184,7 @@ This is the intended boundary, not a requirement to build every layer before it 
 - `src/device/` — future protocol and USB transport modules.
 - `resources/udev/` — user-installed Linux device-access rules.
 - `docs/protocol.md` — sourced protocol knowledge and verification notes.
+- `ROADMAP.md` — product direction, scope boundaries, and milestone outcomes.
 - `.github/workflows/` — continuous integration.
 
 Keep modules cohesive. Split a file when it contains two real responsibilities, not merely because it has become a certain number of lines.
