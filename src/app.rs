@@ -171,6 +171,15 @@ fn supported_view(report: &DiscoveryReport) -> Element<'_, Message> {
     let device = &report.supported[0];
     let model = device.model;
     let extra = additional_devices(report);
+    let session_readiness = match device.control_interface {
+        Some(control) => format!(
+            "Safe control interface {} available ({})",
+            control.number, control.kind
+        ),
+        None => {
+            "No safe control interface found; Selah will not claim the audio interface.".to_owned()
+        }
+    };
 
     let mut content = column![
         status_label("Detected", container::success),
@@ -178,6 +187,7 @@ fn supported_view(report: &DiscoveryReport) -> Element<'_, Message> {
         text("Recognized from its USB descriptor. No interface has been claimed.")
             .size(15)
             .style(text::secondary),
+        text(session_readiness).size(14),
         column![
             detail_row("Microphone inputs", model.mic_inputs),
             detail_row("Digital inputs", model.digital_inputs),

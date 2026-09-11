@@ -4,6 +4,8 @@ Selah is an early-stage Linux control panel for Audient iD audio interfaces, wri
 
 Selah is not ready to control hardware yet. The current application performs read-only USB discovery, identifies known iD models, and reports unknown Audient interfaces without opening the device or claiming an interface.
 
+The device layer can identify and own a safe application/vendor control interface, but that session is not connected to the UI yet and no mixer request is sent.
+
 See the [roadmap](ROADMAP.md) for the path from safe device sessions to MixiD parity and a daily-driver release.
 
 ## Requirements

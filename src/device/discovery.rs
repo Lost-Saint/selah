@@ -1,10 +1,12 @@
-use super::{AUDIENT_VENDOR_ID, DeviceModel, DiscoveryError, supported_device};
+use super::session::select_control_interface;
+use super::{AUDIENT_VENDOR_ID, ControlInterface, DeviceModel, DiscoveryError, supported_device};
 
 /// A recognized Audient interface found during discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetectedDevice {
     pub model: &'static DeviceModel,
     pub reported_name: Option<String>,
+    pub control_interface: Option<ControlInterface>,
 }
 
 /// An Audient interface whose product ID is not in Selah's catalog.
@@ -36,6 +38,10 @@ pub async fn discover() -> Result<DiscoveryReport, DiscoveryError> {
             vendor_id: device.vendor_id(),
             product_id: device.product_id(),
             reported_name: device.product_string().map(str::to_owned),
+            interfaces: device
+                .interfaces()
+                .map(|interface| (interface.interface_number(), interface.class()))
+                .collect(),
         }
     })))
 }
@@ -45,6 +51,7 @@ struct DeviceIdentity {
     vendor_id: u16,
     product_id: u16,
     reported_name: Option<String>,
+    interfaces: Vec<(u8, u8)>,
 }
 
 impl DiscoveryReport {
@@ -60,6 +67,7 @@ impl DiscoveryReport {
                 report.supported.push(DetectedDevice {
                     model,
                     reported_name: device.reported_name,
+                    control_interface: select_control_interface(device.interfaces),
                 });
             } else {
                 report.unsupported.push(UnknownAudientDevice {
@@ -79,7 +87,7 @@ mod tests {
 
     #[test]
     fn ignores_devices_from_other_vendors() {
-        let report = DiscoveryReport::from_identities([identity(0x1234, 0x000d, None)]);
+        let report = DiscoveryReport::from_identities([identity(0x1234, 0x000d, None, &[])]);
 
         assert_eq!(report, DiscoveryReport::default());
     }
@@ -87,8 +95,13 @@ mod tests {
     #[test]
     fn separates_supported_and_unknown_audient_devices() {
         let report = DiscoveryReport::from_identities([
-            identity(AUDIENT_VENDOR_ID, 0x000d, Some("Audient iD24")),
-            identity(AUDIENT_VENDOR_ID, 0xbeef, Some("Future iD")),
+            identity(
+                AUDIENT_VENDOR_ID,
+                0x000d,
+                Some("Audient iD24"),
+                &[(0, 0x01), (4, 0xfe)],
+            ),
+            identity(AUDIENT_VENDOR_ID, 0xbeef, Some("Future iD"), &[]),
         ]);
 
         assert_eq!(report.supported.len(), 1);
@@ -96,6 +109,12 @@ mod tests {
         assert_eq!(
             report.supported[0].reported_name.as_deref(),
             Some("Audient iD24")
+        );
+        assert_eq!(
+            report.supported[0]
+                .control_interface
+                .map(|interface| interface.number),
+            Some(4)
         );
 
         assert_eq!(report.unsupported.len(), 1);
@@ -106,11 +125,17 @@ mod tests {
         );
     }
 
-    fn identity(vendor_id: u16, product_id: u16, reported_name: Option<&str>) -> DeviceIdentity {
+    fn identity(
+        vendor_id: u16,
+        product_id: u16,
+        reported_name: Option<&str>,
+        interfaces: &[(u8, u8)],
+    ) -> DeviceIdentity {
         DeviceIdentity {
             vendor_id,
             product_id,
             reported_name: reported_name.map(str::to_owned),
+            interfaces: interfaces.to_vec(),
         }
     }
 }

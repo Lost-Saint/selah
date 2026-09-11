@@ -41,11 +41,13 @@ Selah has the application foundation and the first read-only hardware slice:
 - asynchronous USB descriptor discovery;
 - recognized, unsupported, absent, scanning, and failure states;
 - manual rescan without opening or claiming the device;
+- safe control-interface detection that prefers application/DFU interfaces and refuses audio interfaces;
+- an explicit device-session primitive that opens and claims only a safe control interface, with drop-based and awaited release paths;
 - hardware-independent catalog and discovery tests;
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-No mixer control request has been sent from Selah yet. No model has been physically verified in Selah.
+The app does not open a device session yet, no mixer control request has been sent from Selah, and no model has been physically verified in Selah.
 
 ## Milestone 1 — Safe device session
 
