@@ -34,9 +34,7 @@ impl Display for ControlInterfaceKind {
 /// Dropping the session releases the interface. Prefer [`DeviceSession::close`]
 /// when the caller can await explicit release and handle a cleanup error.
 pub struct DeviceSession {
-    model: &'static DeviceModel,
-    control: ControlInterface,
-    interface: Option<nusb::Interface>,
+    owner: SessionOwner<UsbTransport>,
 }
 
 impl DeviceSession {
@@ -50,6 +48,108 @@ impl DeviceSession {
     /// Returns a typed error if enumeration, opening, or claiming fails, or if
     /// the device has no safe control interface.
     pub async fn open(selected: &DetectedDevice) -> Result<Self, SessionError> {
+        Ok(Self {
+            owner: SessionOwner::open(UsbTransport, selected).await?,
+        })
+    }
+
+    /// Returns the model associated with this session.
+    #[must_use]
+    pub fn model(&self) -> &'static DeviceModel {
+        self.owner.model
+    }
+
+    /// Returns the claimed non-audio control interface.
+    #[must_use]
+    pub fn control_interface(&self) -> ControlInterface {
+        self.owner.control
+    }
+
+    /// Releases the control interface and closes the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the interface cannot be released cleanly.
+    pub async fn close(self) -> Result<(), SessionError> {
+        self.owner.close().await
+    }
+}
+
+impl std::fmt::Debug for DeviceSession {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceSession")
+            .field("model", &self.model().name)
+            .field("control", &self.control_interface())
+            .finish_non_exhaustive()
+    }
+}
+
+struct SessionOwner<T>
+where
+    T: SessionTransport,
+{
+    transport: T,
+    model: &'static DeviceModel,
+    control: ControlInterface,
+    handle: Option<T::Handle>,
+}
+
+impl<T> SessionOwner<T>
+where
+    T: SessionTransport,
+{
+    async fn open(transport: T, selected: &DetectedDevice) -> Result<Self, T::Error> {
+        let acquired = transport.acquire(selected).await?;
+
+        Ok(Self {
+            transport,
+            model: selected.model,
+            control: acquired.control,
+            handle: Some(acquired.handle),
+        })
+    }
+
+    async fn close(mut self) -> Result<(), T::Error> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+
+        self.transport.release(handle, self.control).await
+    }
+}
+
+struct AcquiredInterface<H> {
+    control: ControlInterface,
+    handle: H,
+}
+
+trait SessionTransport: Send + Sync {
+    type Handle: Send;
+    type Error;
+
+    async fn acquire(
+        &self,
+        selected: &DetectedDevice,
+    ) -> Result<AcquiredInterface<Self::Handle>, Self::Error>;
+
+    async fn release(
+        &self,
+        handle: Self::Handle,
+        control: ControlInterface,
+    ) -> Result<(), Self::Error>;
+}
+
+struct UsbTransport;
+
+impl SessionTransport for UsbTransport {
+    type Handle = nusb::Interface;
+    type Error = SessionError;
+
+    async fn acquire(
+        &self,
+        selected: &DetectedDevice,
+    ) -> Result<AcquiredInterface<Self::Handle>, Self::Error> {
         let model = selected.model;
         let mut devices = nusb::list_devices()
             .await
@@ -85,40 +185,22 @@ impl DeviceSession {
                 source,
             })?;
 
-        Ok(Self {
-            model,
+        Ok(AcquiredInterface {
             control,
-            interface: Some(interface),
+            handle: interface,
         })
     }
 
-    /// Returns the model associated with this session.
-    #[must_use]
-    pub fn model(&self) -> &'static DeviceModel {
-        self.model
-    }
-
-    /// Returns the claimed non-audio control interface.
-    #[must_use]
-    pub fn control_interface(&self) -> ControlInterface {
-        self.control
-    }
-
-    /// Releases the control interface and closes the session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the interface cannot be released cleanly.
-    pub async fn close(mut self) -> Result<(), SessionError> {
-        let Some(interface) = self.interface.take() else {
-            return Ok(());
-        };
-
+    async fn release(
+        &self,
+        interface: Self::Handle,
+        control: ControlInterface,
+    ) -> Result<(), Self::Error> {
         interface
             .release()
             .await
             .map_err(|source| SessionError::Release {
-                interface: self.control.number,
+                interface: control.number,
                 source,
             })
     }
@@ -133,16 +215,6 @@ fn matches_selection(
     selected.location == *location
         && vendor_id == AUDIENT_VENDOR_ID
         && product_id == selected.model.product_id
-}
-
-impl std::fmt::Debug for DeviceSession {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DeviceSession")
-            .field("model", &self.model.name)
-            .field("control", &self.control)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Failure to establish or close a safe device session.
@@ -279,10 +351,168 @@ pub(crate) fn select_control_interface(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures_lite::future::block_on;
+
     use super::{
-        ControlInterface, ControlInterfaceKind, SessionErrorKind, classify_nusb_error,
+        AcquiredInterface, ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation,
+        SessionErrorKind, SessionOwner, SessionTransport, classify_nusb_error,
         select_control_interface,
     };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MockError {
+        Acquire,
+        Release,
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        acquisitions: usize,
+        releases: usize,
+        handles_dropped: usize,
+    }
+
+    struct MockTransport {
+        state: Arc<Mutex<MockState>>,
+        acquire_error: bool,
+        release_error: bool,
+    }
+
+    struct MockHandle(Arc<Mutex<MockState>>);
+
+    impl Drop for MockHandle {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().handles_dropped += 1;
+        }
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "the synchronous mock preserves the asynchronous transport contract"
+    )]
+    impl SessionTransport for MockTransport {
+        type Handle = MockHandle;
+        type Error = MockError;
+
+        async fn acquire(
+            &self,
+            _selected: &DetectedDevice,
+        ) -> Result<AcquiredInterface<Self::Handle>, Self::Error> {
+            self.state.lock().unwrap().acquisitions += 1;
+
+            if self.acquire_error {
+                return Err(MockError::Acquire);
+            }
+
+            Ok(AcquiredInterface {
+                control: ControlInterface {
+                    number: 4,
+                    kind: ControlInterfaceKind::ApplicationSpecific,
+                },
+                handle: MockHandle(Arc::clone(&self.state)),
+            })
+        }
+
+        async fn release(
+            &self,
+            _handle: Self::Handle,
+            _control: ControlInterface,
+        ) -> Result<(), Self::Error> {
+            self.state.lock().unwrap().releases += 1;
+
+            if self.release_error {
+                Err(MockError::Release)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_failure_does_not_attempt_cleanup() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let result = block_on(SessionOwner::open(
+            mock_transport(&state, true, false),
+            &selected_device(),
+        ));
+
+        assert!(matches!(result, Err(MockError::Acquire)));
+        let state = state.lock().unwrap();
+        assert_eq!(state.acquisitions, 1);
+        assert_eq!(state.releases, 0);
+        assert_eq!(state.handles_dropped, 0);
+    }
+
+    #[test]
+    fn explicit_close_releases_and_drops_the_handle() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let owner = block_on(SessionOwner::open(
+            mock_transport(&state, false, false),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        assert_eq!(block_on(owner.close()), Ok(()));
+        let state = state.lock().unwrap();
+        assert_eq!(state.releases, 1);
+        assert_eq!(state.handles_dropped, 1);
+    }
+
+    #[test]
+    fn cleanup_failure_is_returned_after_dropping_the_handle() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let owner = block_on(SessionOwner::open(
+            mock_transport(&state, false, true),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        assert_eq!(block_on(owner.close()), Err(MockError::Release));
+        let state = state.lock().unwrap();
+        assert_eq!(state.releases, 1);
+        assert_eq!(state.handles_dropped, 1);
+    }
+
+    #[test]
+    fn dropping_an_open_session_drops_its_handle() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let owner = block_on(SessionOwner::open(
+            mock_transport(&state, false, false),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        drop(owner);
+        let state = state.lock().unwrap();
+        assert_eq!(state.releases, 0);
+        assert_eq!(state.handles_dropped, 1);
+    }
+
+    fn mock_transport(
+        state: &Arc<Mutex<MockState>>,
+        acquire_error: bool,
+        release_error: bool,
+    ) -> MockTransport {
+        MockTransport {
+            state: Arc::clone(state),
+            acquire_error,
+            release_error,
+        }
+    }
+
+    fn selected_device() -> DetectedDevice {
+        DetectedDevice {
+            location: DeviceLocation {
+                bus: "1".to_owned(),
+                address: 2,
+            },
+            model: crate::device::supported_device(0x000d).unwrap(),
+            reported_name: None,
+            control_interface: None,
+        }
+    }
 
     #[test]
     fn classifies_actionable_usb_errors() {

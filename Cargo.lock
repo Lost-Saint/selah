@@ -2611,6 +2611,7 @@ name = "selah"
 version = "0.1.0"
 dependencies = [
  "futures-core",
+ "futures-lite",
  "iced",
  "nusb",
  "tracing",

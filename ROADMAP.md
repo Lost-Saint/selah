@@ -44,7 +44,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - event-driven refresh when USB devices connect or disconnect;
 - safe control-interface detection that prefers application/DFU interfaces and refuses audio interfaces;
 - an explicit device-session primitive that opens and claims only a safe control interface, with drop-based and awaited release paths;
-- hardware-independent catalog and discovery tests;
+- hardware-independent catalog, discovery, and session-lifecycle tests;
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
@@ -59,7 +59,7 @@ The app does not open a device session yet, no mixer control request has been se
 - Give the device session one owner with deterministic claim, release, and shutdown behavior.
 - Keep device I/O serialized and away from Iced's UI thread.
 - Distinguish permission denied, device busy, disconnected, and unsupported-interface errors. ✅
-- Introduce a mockable transport boundary and test acquisition and cleanup failures.
+- Introduce a mockable transport boundary and test acquisition and cleanup failures. ✅
 - Send one harmless, bounded control request on the maintainer's first test model.
 
 **Exit condition:** repeated connect, disconnect, application-close, and forced-error tests leave PipeWire or ALSA audio working normally on the first target model.

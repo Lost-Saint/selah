@@ -12,6 +12,9 @@ nusb = { version = "0.2", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+futures-lite = "2"
+
 [lints.rust]
 unsafe_code = "forbid"
 
