@@ -22,6 +22,16 @@ fn sends_harmless_speaker_volume_request() {
         .block_on(check_speaker_volume());
 }
 
+#[test]
+#[ignore = "claims a physical device; set SELAH_HARDWARE_PRODUCT_ID and run explicitly"]
+fn sends_harmless_headphone_volume_request() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Tokio runtime should start")
+        .block_on(check_headphone_volume());
+}
+
 async fn check_session() {
     let selected = select_single_device().await;
 
@@ -45,6 +55,23 @@ async fn check_speaker_volume() {
         .set_speaker_level(level)
         .await
         .expect("speaker volume request should succeed");
+    session
+        .close()
+        .await
+        .expect("safe session should close cleanly");
+}
+
+async fn check_headphone_volume() {
+    let selected = select_single_device().await;
+
+    let mut session = DeviceSession::open(&selected)
+        .await
+        .expect("safe session should open");
+    let level = NormalizedLevel::new(0.1).expect("0.1 is a valid mixer level");
+    session
+        .set_headphone_level(level)
+        .await
+        .expect("headphone volume requests should succeed");
     session
         .close()
         .await

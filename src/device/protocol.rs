@@ -4,6 +4,10 @@ use std::fmt::{self, Display, Formatter};
 const SET_CURRENT: u8 = 0x01;
 const SPEAKER_VOLUME_CONTROL: u16 = 0x1200;
 const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
+// MixiD `set_hp_volume` (driver.h) sends the same level twice, once per
+// headphone channel, against output entity `0x0a`.
+const HEADPHONE_VOLUME_CONTROLS: [u16; 2] = [0x0203, 0x0204];
+const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0a00;
 
 /// A finite mixer level between silence (`0.0`) and full scale (`1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,9 +65,26 @@ pub(crate) fn speaker_volume(level: NormalizedLevel, interface_number: u8) -> Co
     }
 }
 
+/// Encodes headphone volume as the two channel requests `MixiD` sends.
+///
+/// `MixiD` `set_hp_volume` (driver.h) writes the same level to controls
+/// `0x0203` and `0x0204` against output entity `0x0a`; both transfers must
+/// succeed for the left and right channels to stay matched.
+pub(crate) fn headphone_volume(
+    level: NormalizedLevel,
+    interface_number: u8,
+) -> [ControlRequest; 2] {
+    HEADPHONE_VOLUME_CONTROLS.map(|control| ControlRequest {
+        request: SET_CURRENT,
+        value: control,
+        index: HEADPHONE_OUTPUT_ENTITY | u16::from(interface_number),
+        payload: level.audient_value().to_le_bytes().to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ControlRequest, NormalizedLevel, speaker_volume};
+    use super::{ControlRequest, NormalizedLevel, headphone_volume, speaker_volume};
 
     #[test]
     fn rejects_invalid_normalized_levels() {
@@ -91,5 +112,32 @@ mod tests {
             speaker_volume(NormalizedLevel::new(1.0).unwrap(), 4).payload,
             vec![0xff, 0xff]
         );
+    }
+
+    #[test]
+    fn encodes_reference_headphone_volume_requests() {
+        assert_eq!(
+            headphone_volume(NormalizedLevel::new(0.0).unwrap(), 4),
+            [
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0203,
+                    index: 0x0a04,
+                    payload: vec![0x00, 0x80],
+                },
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0204,
+                    index: 0x0a04,
+                    payload: vec![0x00, 0x80],
+                },
+            ]
+        );
+        for request in headphone_volume(NormalizedLevel::new(0.5).unwrap(), 4) {
+            assert_eq!(request.payload, vec![0x00, 0xc0]);
+        }
+        for request in headphone_volume(NormalizedLevel::new(1.0).unwrap(), 4) {
+            assert_eq!(request.payload, vec![0xff, 0xff]);
+        }
     }
 }

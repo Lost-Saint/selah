@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
-use super::protocol::{ControlRequest, speaker_volume};
+use super::protocol::{ControlRequest, headphone_volume, speaker_volume};
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
@@ -80,6 +80,29 @@ impl DeviceSession {
     pub async fn set_speaker_level(&mut self, level: NormalizedLevel) -> Result<(), SessionError> {
         let request = speaker_volume(level, self.control_interface().number);
         self.owner.send(&request).await
+    }
+
+    /// Sets the headphone level using the reference-derived Audient requests.
+    ///
+    /// The level is sent to both headphone channels in order on this
+    /// session, so the two transfers stay serialized with other device I/O.
+    /// A failure stops the sequence so a partial left/right mismatch is
+    /// reported instead of silently kept.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded USB transfer fails.
+    pub async fn set_headphone_level(
+        &mut self,
+        level: NormalizedLevel,
+    ) -> Result<(), SessionError> {
+        for request in headphone_volume(level, self.control_interface().number) {
+            self.owner.send(&request).await?;
+        }
+        Ok(())
     }
 
     /// Releases the control interface and closes the session.

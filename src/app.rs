@@ -11,16 +11,17 @@ struct App {
     scan_in_flight: bool,
     rescan_requested: bool,
     watch_status: WatchStatus,
-    speaker: SpeakerControl,
+    speaker: VolumeControl,
+    headphone: VolumeControl,
 }
 
-/// Slider position and send state for main speaker volume.
+/// Slider position and send state for one output volume.
 ///
 /// `position` is only what the user last requested. Selah has no state
 /// readback, so it is never presented as the device's confirmed level.
 /// `last_sent` records the most recent level the device acknowledged.
 #[derive(Clone, Debug, Default)]
-struct SpeakerControl {
+struct VolumeControl {
     position: f32,
     in_flight: Option<f32>,
     queued: Option<f32>,
@@ -36,6 +37,14 @@ struct SpeakerVolumeOutcome {
     result: Result<(), String>,
 }
 
+/// Outcome of one background headphone-volume send, paired with the level
+/// it attempted so stale completions can be ignored after a rescan.
+#[derive(Clone, Debug)]
+struct HeadphoneVolumeOutcome {
+    level: f32,
+    result: Result<(), String>,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
@@ -43,6 +52,8 @@ enum Message {
     DiscoveryFinished(Result<DiscoveryReport, DiscoveryError>),
     SpeakerVolumeChanged(f32),
     SpeakerVolumeFinished(SpeakerVolumeOutcome),
+    HeadphoneVolumeChanged(f32),
+    HeadphoneVolumeFinished(HeadphoneVolumeOutcome),
 }
 
 enum DeviceStatus {
@@ -77,7 +88,8 @@ impl App {
                 scan_in_flight: false,
                 rescan_requested: false,
                 watch_status: WatchStatus::Starting,
-                speaker: SpeakerControl::default(),
+                speaker: VolumeControl::default(),
+                headphone: VolumeControl::default(),
             },
             Task::none(),
         )
@@ -106,7 +118,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 "Audient device scan completed"
             );
             app.status = DeviceStatus::Ready(report);
-            app.speaker = SpeakerControl::default();
+            app.speaker = VolumeControl::default();
+            app.headphone = VolumeControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
@@ -115,23 +128,28 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 "Found an unrecognized Audient interface"
             );
             app.status = DeviceStatus::Unsupported(report);
-            app.speaker = SpeakerControl::default();
+            app.speaker = VolumeControl::default();
+            app.headphone = VolumeControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(_)) => {
             tracing::info!("No Audient interface detected");
             app.status = DeviceStatus::Empty;
-            app.speaker = SpeakerControl::default();
+            app.speaker = VolumeControl::default();
+            app.headphone = VolumeControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Err(error)) => {
             tracing::error!(%error, "Audient device scan failed");
             app.status = DeviceStatus::Failed(error);
-            app.speaker = SpeakerControl::default();
+            app.speaker = VolumeControl::default();
+            app.headphone = VolumeControl::default();
             finish_scan(app)
         }
         Message::SpeakerVolumeChanged(level) => request_speaker_volume(app, level),
         Message::SpeakerVolumeFinished(outcome) => finish_speaker_volume(app, outcome),
+        Message::HeadphoneVolumeChanged(level) => request_headphone_volume(app, level),
+        Message::HeadphoneVolumeFinished(outcome) => finish_headphone_volume(app, outcome),
     }
 }
 
@@ -207,6 +225,78 @@ fn finish_speaker_volume(app: &mut App, outcome: SpeakerVolumeOutcome) -> Task<M
     }
 }
 
+/// Starts a background headphone-volume send, queuing when one is in flight.
+///
+/// Only one send runs at a time: a change made while sending is remembered
+/// as `queued` and started when the in-flight send completes. The USB work
+/// runs in the returned task, away from Iced's UI thread.
+fn request_headphone_volume(app: &mut App, level: f32) -> Task<Message> {
+    if !level.is_finite() {
+        return Task::none();
+    }
+    let level = level.clamp(0.0, 1.0);
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+
+    app.headphone.position = level;
+    app.headphone.last_error = None;
+
+    if app.headphone.in_flight.is_some() {
+        app.headphone.queued = Some(level);
+        return Task::none();
+    }
+
+    app.headphone.in_flight = Some(level);
+    app.headphone.queued = None;
+    headphone_task(device, level)
+}
+
+/// Records a background send result and starts the queued level, if any.
+///
+/// Stale completions from before a rescan are ignored: a rescan resets the
+/// headphone state, so a completion whose level is not in flight belongs to
+/// a previous device set.
+///
+/// Levels here are compared exactly because they are copied slider values
+/// used as request identities, not computed arithmetic.
+#[allow(clippy::float_cmp, reason = "copied slider levels identify requests")]
+fn finish_headphone_volume(app: &mut App, outcome: HeadphoneVolumeOutcome) -> Task<Message> {
+    let HeadphoneVolumeOutcome { level, result } = outcome;
+    if app.headphone.in_flight != Some(level) {
+        return Task::none();
+    }
+
+    match result {
+        Ok(()) => {
+            tracing::info!(level, "Headphone volume sent");
+            app.headphone.last_sent = Some(level);
+            app.headphone.last_error = None;
+        }
+        Err(error) => {
+            tracing::warn!(level, %error, "Headphone volume send failed");
+            app.headphone.last_error = Some(error);
+        }
+    }
+
+    let next = app.headphone.queued.take();
+    match next {
+        Some(next) if next != level => {
+            app.headphone.in_flight = Some(next);
+            if let Some(device) = selected_device(app) {
+                headphone_task(device, next)
+            } else {
+                app.headphone.in_flight = None;
+                Task::none()
+            }
+        }
+        _ => {
+            app.headphone.in_flight = None;
+            Task::none()
+        }
+    }
+}
+
 /// The first supported device, matching what `supported_view` displays.
 fn selected_device(app: &App) -> Option<DetectedDevice> {
     match &app.status {
@@ -219,6 +309,13 @@ fn volume_task(device: DetectedDevice, level: f32) -> Task<Message> {
     Task::perform(
         apply_speaker_volume(device, level),
         Message::SpeakerVolumeFinished,
+    )
+}
+
+fn headphone_task(device: DetectedDevice, level: f32) -> Task<Message> {
+    Task::perform(
+        apply_headphone_volume(device, level),
+        Message::HeadphoneVolumeFinished,
     )
 }
 
@@ -247,6 +344,33 @@ async fn apply_speaker_volume(device: DetectedDevice, level: f32) -> SpeakerVolu
     .await;
 
     SpeakerVolumeOutcome { level, result }
+}
+
+/// Opens a session, sends one bounded headphone request, and always closes.
+///
+/// Runs inside an Iced task, away from the UI thread. Validation happens
+/// before any USB I/O; the session is closed on both success and failure.
+async fn apply_headphone_volume(device: DetectedDevice, level: f32) -> HeadphoneVolumeOutcome {
+    let result = async {
+        let valid = NormalizedLevel::new(level).map_err(|error| error.to_string())?;
+        let mut session = DeviceSession::open(&device)
+            .await
+            .map_err(|error| format!("{error} — {}", error.recovery_hint()))?;
+        let send = session.set_headphone_level(valid).await;
+        let close = session.close().await;
+        match send {
+            Ok(()) => close.map_err(|error| format!("{error} — {}", error.recovery_hint())),
+            Err(error) => {
+                if let Err(close_error) = close {
+                    tracing::warn!(%close_error, "Control interface release failed after send error");
+                }
+                Err(format!("{error} — {}", error.recovery_hint()))
+            }
+        }
+    }
+    .await;
+
+    HeadphoneVolumeOutcome { level, result }
 }
 
 fn request_scan(app: &mut App) -> Task<Message> {
@@ -310,7 +434,7 @@ fn view(app: &App) -> Element<'_, Message> {
                 .style(text::secondary),
         ]
         .spacing(8),
-        container(status_view(&app.status, &app.speaker))
+        container(status_view(&app.status, &app.speaker, &app.headphone))
             .width(Fill)
             .padding(28)
             .style(container::rounded_box),
@@ -336,7 +460,11 @@ fn watch_status(app: &App) -> &'static str {
     }
 }
 
-fn status_view<'a>(status: &'a DeviceStatus, speaker: &'a SpeakerControl) -> Element<'a, Message> {
+fn status_view<'a>(
+    status: &'a DeviceStatus,
+    speaker: &'a VolumeControl,
+    headphone: &'a VolumeControl,
+) -> Element<'a, Message> {
     match status {
         DeviceStatus::Scanning => column![
             status_label("Scanning", container::secondary),
@@ -356,7 +484,7 @@ fn status_view<'a>(status: &'a DeviceStatus, speaker: &'a SpeakerControl) -> Ele
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => supported_view(report, speaker),
+        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone),
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -371,7 +499,8 @@ fn status_view<'a>(status: &'a DeviceStatus, speaker: &'a SpeakerControl) -> Ele
 
 fn supported_view<'a>(
     report: &'a DiscoveryReport,
-    speaker: &'a SpeakerControl,
+    speaker: &'a VolumeControl,
+    headphone: &'a VolumeControl,
 ) -> Element<'a, Message> {
     let device = &report.supported[0];
     let model = device.model;
@@ -404,10 +533,11 @@ fn supported_view<'a>(
     ]
     .spacing(14);
 
-    // Capability-driven: the volume control only exists when a safe control
+    // Capability-driven: the volume controls only exist when a safe control
     // interface is available. Without one there is nothing to send through.
     if device.control_interface.is_some() {
         content = content.push(speaker_view(speaker));
+        content = content.push(headphone_view(headphone));
     }
 
     if let Some(extra) = extra {
@@ -426,7 +556,7 @@ fn supported_view<'a>(
 /// Queued and in-flight levels are compared exactly because they are copied
 /// slider values identifying requests, not computed arithmetic.
 #[allow(clippy::float_cmp, reason = "copied slider levels identify requests")]
-fn speaker_view(speaker: &SpeakerControl) -> Element<'_, Message> {
+fn speaker_view(speaker: &VolumeControl) -> Element<'_, Message> {
     let status = match (speaker.in_flight, &speaker.last_error, speaker.last_sent) {
         (Some(sending), _, _) => match speaker.queued {
             Some(requested) if requested != sending => format!(
@@ -451,6 +581,55 @@ fn speaker_view(speaker: &SpeakerControl) -> Element<'_, Message> {
     column![
         text("Speaker volume").size(16),
         slider(0.0..=1.0, speaker.position, Message::SpeakerVolumeChanged).step(0.01_f32),
+        text(status).size(13).style(text::secondary),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// Headphone volume without implying confirmed device state.
+///
+/// Selah cannot read the current level back, so the slider position is the
+/// last requested level and the status line reports what was sent — never
+/// what the device is confirmed to hold.
+///
+/// Queued and in-flight levels are compared exactly because they are copied
+/// slider values identifying requests, not computed arithmetic.
+#[allow(clippy::float_cmp, reason = "copied slider levels identify requests")]
+fn headphone_view(headphone: &VolumeControl) -> Element<'_, Message> {
+    let status = match (
+        headphone.in_flight,
+        &headphone.last_error,
+        headphone.last_sent,
+    ) {
+        (Some(sending), _, _) => match headphone.queued {
+            Some(requested) if requested != sending => format!(
+                "Sending {:.0}%… (latest request {:.0}%)",
+                sending * 100.0,
+                requested * 100.0
+            ),
+            _ => format!("Sending {:.0}%…", sending * 100.0),
+        },
+        (None, Some(error), _) => format!("Send failed: {error} Move the slider to retry."),
+        (None, None, Some(sent)) => {
+            format!(
+                "Last sent {:.0}% — not read back from the device.",
+                sent * 100.0
+            )
+        }
+        (None, None, None) => {
+            "No value read from the device — moving the slider sends a new level.".to_owned()
+        }
+    };
+
+    column![
+        text("Headphone volume").size(16),
+        slider(
+            0.0..=1.0,
+            headphone.position,
+            Message::HeadphoneVolumeChanged
+        )
+        .step(0.01_f32),
         text(status).size(13).style(text::secondary),
     ]
     .spacing(8)
@@ -508,7 +687,8 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DeviceStatus, Message, SpeakerVolumeOutcome, finish_scan, request_scan, update,
+        App, DeviceStatus, HeadphoneVolumeOutcome, Message, SpeakerVolumeOutcome, finish_scan,
+        request_scan, update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
@@ -611,6 +791,110 @@ mod tests {
         assert_eq!(app.speaker.in_flight, Some(0.3));
         assert_eq!(app.speaker.queued, None);
         assert_eq!(app.speaker.last_sent, Some(0.2));
+    }
+
+    #[test]
+    fn headphone_volume_moves_from_pending_to_applied() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(&mut app, Message::HeadphoneVolumeChanged(0.2));
+        assert_level_eq(app.headphone.position, 0.2);
+        assert_eq!(app.headphone.in_flight, Some(0.2));
+        assert_eq!(app.headphone.last_sent, None);
+
+        let _done = update(
+            &mut app,
+            Message::HeadphoneVolumeFinished(HeadphoneVolumeOutcome {
+                level: 0.2,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(app.headphone.in_flight, None);
+        assert_eq!(app.headphone.last_sent, Some(0.2));
+        assert_eq!(app.headphone.last_error, None);
+    }
+
+    #[test]
+    fn headphone_volume_failure_keeps_last_sent_and_reports_the_error() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _first = update(&mut app, Message::HeadphoneVolumeChanged(0.2));
+        let _applied = update(
+            &mut app,
+            Message::HeadphoneVolumeFinished(HeadphoneVolumeOutcome {
+                level: 0.2,
+                result: Ok(()),
+            }),
+        );
+
+        let _retry = update(&mut app, Message::HeadphoneVolumeChanged(0.3));
+        assert_eq!(app.headphone.in_flight, Some(0.3));
+        let _failed = update(
+            &mut app,
+            Message::HeadphoneVolumeFinished(HeadphoneVolumeOutcome {
+                level: 0.3,
+                result: Err("no device".to_owned()),
+            }),
+        );
+
+        assert_eq!(app.headphone.in_flight, None);
+        // The failed level is not presented as confirmed: the previous
+        // acknowledged send is preserved and the error stays visible.
+        assert_level_eq(app.headphone.position, 0.3);
+        assert_eq!(app.headphone.last_sent, Some(0.2));
+        assert_eq!(app.headphone.last_error.as_deref(), Some("no device"));
+    }
+
+    #[test]
+    fn headphone_volume_changes_while_sending_are_queued_behind_one_send() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _first = update(&mut app, Message::HeadphoneVolumeChanged(0.2));
+        let _second = update(&mut app, Message::HeadphoneVolumeChanged(0.3));
+
+        // Still a single send in flight; the latest request waits its turn.
+        assert_eq!(app.headphone.in_flight, Some(0.2));
+        assert_eq!(app.headphone.queued, Some(0.3));
+        assert_level_eq(app.headphone.position, 0.3);
+
+        let _next = update(
+            &mut app,
+            Message::HeadphoneVolumeFinished(HeadphoneVolumeOutcome {
+                level: 0.2,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(app.headphone.in_flight, Some(0.3));
+        assert_eq!(app.headphone.queued, None);
+        assert_eq!(app.headphone.last_sent, Some(0.2));
+    }
+
+    #[test]
+    fn speaker_and_headphone_sends_track_independently() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _speaker_send = update(&mut app, Message::SpeakerVolumeChanged(0.2));
+        let _headphone_send = update(&mut app, Message::HeadphoneVolumeChanged(0.4));
+
+        assert_eq!(app.speaker.in_flight, Some(0.2));
+        assert_eq!(app.headphone.in_flight, Some(0.4));
+
+        let _speaker_done = update(
+            &mut app,
+            Message::SpeakerVolumeFinished(SpeakerVolumeOutcome {
+                level: 0.2,
+                result: Ok(()),
+            }),
+        );
+
+        // Finishing one control leaves the other untouched.
+        assert_eq!(app.speaker.last_sent, Some(0.2));
+        assert_eq!(app.headphone.in_flight, Some(0.4));
+        assert_eq!(app.headphone.last_sent, None);
     }
 
     fn assert_level_eq(actual: f32, expected: f32) {
