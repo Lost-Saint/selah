@@ -9,7 +9,7 @@ mod session;
 mod watch;
 
 pub use catalog::{AUDIENT_VENDOR_ID, DeviceModel, SUPPORTED_DEVICES, supported_device};
-pub use control::{send_headphone_level, send_speaker_level};
+pub use control::{send_headphone_level, send_phones_to_main_mix, send_speaker_level};
 pub use discovery::{
     DetectedDevice, DeviceLocation, DiscoveryReport, UnknownAudientDevice, discover,
 };

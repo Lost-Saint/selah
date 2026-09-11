@@ -12,6 +12,14 @@ const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
 // (see docs/protocol.md).
 const HEADPHONE_VOLUME_CONTROLS: [u16; 2] = [0x0203, 0x0204];
 const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0c00;
+// Phones-to-Main-Mix routing lives on mixer entity `0x33`: `MixiD`
+// `set_routing_value` (driver.h) writes one byte per channel with
+// `wValue = chanVals[chan]`. Channels 4 and 5 are HP L/R; position 0 is
+// Main Mix (`0x1b` left, `0x1c` right). Both transfers must succeed for
+// the pair to stay matched.
+const ROUTING_ENTITY: u16 = 0x3300;
+const PHONES_ROUTE_CONTROLS: [u16; 2] = [0x0604, 0x0605];
+const MAIN_MIX_ROUTES: [u8; 2] = [0x1b, 0x1c];
 
 /// A finite mixer level between silence (`0.0`) and full scale (`1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -87,9 +95,25 @@ pub(crate) fn headphone_volume(
     })
 }
 
+/// Encodes routing the headphone pair to Main Mix as two channel requests.
+///
+/// `MixiD` `routeToggle` rows 4 and 5 (HP L/R) select Main Mix with values
+/// `0x1b` and `0x1c`. This is one-way: Selah cannot read the current route
+/// back, so callers must present the result as sent, never confirmed.
+pub(crate) fn phones_to_main_mix(interface_number: u8) -> [ControlRequest; 2] {
+    std::array::from_fn(|i| ControlRequest {
+        request: SET_CURRENT,
+        value: PHONES_ROUTE_CONTROLS[i],
+        index: ROUTING_ENTITY | u16::from(interface_number),
+        payload: vec![MAIN_MIX_ROUTES[i]],
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ControlRequest, NormalizedLevel, headphone_volume, speaker_volume};
+    use super::{
+        ControlRequest, NormalizedLevel, headphone_volume, phones_to_main_mix, speaker_volume,
+    };
 
     #[test]
     fn rejects_invalid_normalized_levels() {
@@ -144,5 +168,26 @@ mod tests {
         for request in headphone_volume(NormalizedLevel::new(1.0).unwrap(), 4) {
             assert_eq!(request.payload, vec![0xff, 0xff]);
         }
+    }
+
+    #[test]
+    fn encodes_phones_to_main_mix_requests() {
+        assert_eq!(
+            phones_to_main_mix(4),
+            [
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0604,
+                    index: 0x3304,
+                    payload: vec![0x1b],
+                },
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0605,
+                    index: 0x3304,
+                    payload: vec![0x1c],
+                },
+            ]
+        );
     }
 }

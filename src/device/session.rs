@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
-use super::protocol::{ControlRequest, headphone_volume, speaker_volume};
+use super::protocol::{ControlRequest, headphone_volume, phones_to_main_mix, speaker_volume};
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
@@ -100,6 +100,25 @@ impl DeviceSession {
         level: NormalizedLevel,
     ) -> Result<(), SessionError> {
         for request in headphone_volume(level, self.control_interface().number) {
+            self.owner.send(&request).await?;
+        }
+        Ok(())
+    }
+
+    /// Routes the headphone pair to Main Mix using reference-derived requests.
+    ///
+    /// Both channel transfers run in order on this session. A failure stops
+    /// the sequence so a partial left/right mismatch is reported instead of
+    /// silently kept. This is one-way: Selah cannot read routing back.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded USB transfer fails.
+    pub async fn set_phones_to_main_mix(&mut self) -> Result<(), SessionError> {
+        for request in phones_to_main_mix(self.control_interface().number) {
             self.owner.send(&request).await?;
         }
         Ok(())

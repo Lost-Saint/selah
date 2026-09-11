@@ -3,6 +3,7 @@
 mod app;
 pub mod device;
 mod monitor;
+mod routing;
 
 /// Starts the Selah desktop application.
 ///

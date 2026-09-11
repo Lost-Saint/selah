@@ -815,6 +815,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routing_request_without_a_device_is_ignored() {
+        use crate::routing::RouteStatus;
+
+        let (mut app, _startup) = App::new();
+
+        let _ignored = update(&mut app, Message::RoutePhonesToMainMix);
+        assert_eq!(app.routing.status(), RouteStatus::Unknown);
+    }
+
+    #[test]
+    fn routing_moves_from_unknown_through_sending_to_sent() {
+        use crate::routing::RouteStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(&mut app, Message::RoutePhonesToMainMix);
+        assert_eq!(app.routing.status(), RouteStatus::Sending);
+
+        let _done = update(&mut app, Message::RoutingFinished(Ok(())));
+        assert_eq!(app.routing.status(), RouteStatus::Sent);
+    }
+
+    #[test]
+    fn routing_failure_reports_the_error() {
+        use crate::routing::RouteStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(&mut app, Message::RoutePhonesToMainMix);
+        let _failed = update(
+            &mut app,
+            Message::RoutingFinished(Err("no device".to_owned())),
+        );
+        assert_eq!(
+            app.routing.status(),
+            RouteStatus::Failed {
+                error: "no device".to_owned(),
+                ever_sent: false,
+            }
+        );
+    }
+
+    #[test]
+    fn second_routing_request_while_sending_is_ignored() {
+        use crate::routing::RouteStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _first = update(&mut app, Message::RoutePhonesToMainMix);
+        let _second = update(&mut app, Message::RoutePhonesToMainMix);
+        assert_eq!(app.routing.status(), RouteStatus::Sending);
+
+        let _done = update(&mut app, Message::RoutingFinished(Ok(())));
+        assert_eq!(app.routing.status(), RouteStatus::Sent);
+    }
+
+    #[test]
+    fn stale_routing_completion_after_a_rescan_is_ignored() {
+        use crate::routing::RouteStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(&mut app, Message::RoutePhonesToMainMix);
+        let _rescan = update(
+            &mut app,
+            Message::DiscoveryFinished(Ok(DiscoveryReport::default())),
+        );
+        let _stale = update(&mut app, Message::RoutingFinished(Ok(())));
+
+        assert!(matches!(app.status, DeviceStatus::Empty));
+        assert_eq!(app.routing.status(), RouteStatus::Unknown);
+    }
+
     fn assert_level_eq(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < f32::EPSILON,

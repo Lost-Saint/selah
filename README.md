@@ -2,9 +2,9 @@
 
 Selah is an early-stage Linux control panel for Audient iD audio interfaces, written in Rust with [Iced](https://iced.rs/) and [`nusb`](https://crates.io/crates/nusb). It builds on the device and protocol research in [MixiD](https://github.com/TheOnlyJoey/MixiD).
 
-Selah is not ready to control hardware yet. The current application performs read-only USB discovery, automatically refreshes when USB devices connect or disconnect, identifies known iD models, and reports unknown Audient interfaces without opening the device or claiming an interface.
+The current application performs USB descriptor discovery, automatically refreshes when USB devices connect or disconnect, identifies known iD models, and reports unknown Audient interfaces. It can also send reference-derived speaker and headphone volume from the UI through serialized background tasks that briefly claim a safe control interface per send, then release it. There is no state readback: each slider shows the last requested level, not confirmed device state.
 
-The device layer can identify and own a safe application/vendor control interface, but that session is not connected to the UI yet and no mixer request is sent.
+Transfer acceptance for both volumes was verified on an iD14 MKII without disturbing Linux audio, but the audible change is unconfirmed (headphones-only setup; the phones appear routed to a fixed-level feed, not Main Mix). See [`docs/protocol.md`](docs/protocol.md). Treat both mappings as reference-derived.
 
 See the [roadmap](ROADMAP.md) for the path from safe device sessions to MixiD parity and a daily-driver release.
 
