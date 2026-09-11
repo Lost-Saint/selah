@@ -20,11 +20,11 @@ Selah currently enumerates USB descriptors and filters them by Audient's vendor 
 
 For known devices, discovery also looks for an application-specific (`0xfe`) or vendor-specific (`0xff`) USB interface. A device session may claim one of those interfaces without detaching a kernel driver. Selah intentionally refuses to fall back to an audio-class interface until that behavior can be designed and verified safely.
 
-Control-request execution is not enabled yet. Add verified request details here as the Rust transport is implemented; do not infer support from the C++ reference compiling or from a device being present in the catalog.
+Control-request execution is limited to speaker volume: the UI slider and the opt-in hardware check send the reference-derived request below through a serialized background task. Do not infer support for other controls from the C++ reference compiling or from a device being present in the catalog.
 
 ### Reference-derived speaker volume
 
-MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue = 0x1200`, an output entity of `0x36`, and a two-byte little-endian signed value mapping normalized `0.0..=1.0` to `-32768..=-1`. Selah encodes this request as pure data and validates the input range. The opt-in hardware check `sends_harmless_speaker_volume_request` opens a safe session, sends level `0.1`, and closes the session:
+MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue = 0x1200`, an output entity of `0x36`, and a two-byte little-endian signed value mapping normalized `0.0..=1.0` to `-32768..=-1`. Selah encodes this request as pure data and validates the input range. The UI slider sends it through a background task that opens a safe session, sends one bounded request, and closes the session; the slider position is the last requested level, and the status line reports only what was sent, since Selah cannot read the level back. The opt-in hardware check `sends_harmless_speaker_volume_request` exercises the same path with level `0.1`:
 
 ```sh
 SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored --exact sends_harmless_speaker_volume_request

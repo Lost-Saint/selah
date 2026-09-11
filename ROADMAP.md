@@ -48,7 +48,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app does not open a device session yet and no mixer control request has been sent from Selah. A safe claim-and-release cycle has been physically verified on an iD14 MKII without disturbing its Linux audio interfaces; broader connect, disconnect, shutdown, and failure testing is still required.
+The app can send reference-derived speaker volume from the UI through a serialized background task that claims and releases the control interface per send, with pending, sent, and failed states and no state readback. The volume mapping has not been hardware-verified yet: the opt-in `sends_harmless_speaker_volume_request` check is still awaiting a physical run, so Milestone 1 is not closed. A safe claim-and-release cycle has been physically verified on an iD14 MKII without disturbing its Linux audio interfaces; broader connect, disconnect, shutdown, and failure testing is still required.
 
 ## Milestone 1 — Safe device session
 
@@ -57,7 +57,7 @@ The app does not open a device session yet and no mixer control request has been
 - Detect hot-plug and removal instead of relying only on manual scans. ✅
 - Inspect USB interfaces and prefer the spare DFU or vendor interface identified by [MixiD issue #15](https://github.com/TheOnlyJoey/MixiD/issues/15). ✅
 - Give the device session one owner with deterministic claim, release, and shutdown behavior. ✅
-- Keep device I/O serialized and away from Iced's UI thread.
+- Keep device I/O serialized and away from Iced's UI thread. ✅
 - Distinguish permission denied, device busy, disconnected, and unsupported-interface errors. ✅
 - Introduce a mockable transport boundary and test acquisition and cleanup failures. ✅
 - Send one harmless, bounded control request on the maintainer's first test model.
