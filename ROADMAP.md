@@ -48,7 +48,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app can send reference-derived speaker volume from the UI through a serialized background task that claims and releases the control interface per send, with pending, sent, and failed states and no state readback. The volume request transfer was verified on an iD14 MKII without disturbing its Linux audio interfaces, but the audible change is unconfirmed (headphones-only setup), so the mapping stays reference-derived. A safe claim-and-release cycle was also physically verified on the same model; broader connect, disconnect, shutdown, and failure testing is still required, so Milestone 1 is not closed.
+The app can send reference-derived speaker volume from the UI through a serialized background task that claims and releases the control interface per send, with pending, sent, and failed states and no state readback. The volume request transfer was verified on an iD14 MKII without disturbing its Linux audio interfaces, but the audible change is unconfirmed (headphones-only setup), so the mapping stays reference-derived. A safe claim-and-release cycle was also physically verified on the same model, followed by 5 back-to-back session/volume cycles and a busy-interface forced-error probe with recovery, all leaving Linux audio working. The maintainer additionally verified GUI app-close while connected and physical unplug/replug with recovery. The one unverified leg is hardware permission-denied handling, which needs ACL/udev manipulation this environment cannot do without root; that path fails before any handle is acquired and its kind mapping is unit-tested.
 
 ## Milestone 1 — Safe device session
 
@@ -62,7 +62,7 @@ The app can send reference-derived speaker volume from the UI through a serializ
 - Introduce a mockable transport boundary and test acquisition and cleanup failures. ✅
 - Send one harmless, bounded control request on the maintainer's first test model. ✅
 
-**Exit condition:** repeated connect, disconnect, application-close, and forced-error tests leave PipeWire or ALSA audio working normally on the first target model.
+**Exit condition:** repeated connect, disconnect, application-close, and forced-error tests leave PipeWire or ALSA audio working normally on the first target model. ✅ (verified 2026-09-11 on the iD14 MKII; hardware permission-denied is the documented exception above)
 
 ## Milestone 2 — Essential monitoring
 
@@ -157,6 +157,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The current target is **Milestone 1: Safe device session**, using the iD14 MKII as the initial reference device. The architecture must remain capability-driven and avoid baking in its channel layout. The next software boundary is serialized device I/O; any state-changing control request remains an explicit hardware-verification step.
+The current target is **Milestone 2: Essential monitoring**, starting with main speaker volume on the iD14 MKII as the initial reference device. The volume mapping stays reference-derived until its audible change is confirmed on speakers. The architecture must remain capability-driven and avoid baking in that model's channel layout.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.
