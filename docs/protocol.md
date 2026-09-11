@@ -20,7 +20,11 @@ Selah currently enumerates USB descriptors and filters them by Audient's vendor 
 
 For known devices, discovery also looks for an application-specific (`0xfe`) or vendor-specific (`0xff`) USB interface. A device session may claim one of those interfaces without detaching a kernel driver. Selah intentionally refuses to fall back to an audio-class interface until that behavior can be designed and verified safely.
 
-Control requests have not been ported yet. Add verified request details here as the Rust transport is implemented; do not infer support from the C++ reference compiling or from a device being present in the catalog.
+Control-request execution is not enabled yet. Add verified request details here as the Rust transport is implemented; do not infer support from the C++ reference compiling or from a device being present in the catalog.
+
+### Reference-derived speaker volume
+
+MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue = 0x1200`, an output entity of `0x36`, and a two-byte little-endian signed value mapping normalized `0.0..=1.0` to `-32768..=-1`. Selah encodes this request as pure data and validates the input range, but has not sent it to hardware yet. Treat this mapping as reference-derived until the opt-in iD14 MKII check succeeds.
 
 ## Hardware verification
 

@@ -1,7 +1,11 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
-use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel};
+use nusb::transfer::{ControlOut, ControlType, Recipient};
+
+use super::protocol::{ControlRequest, speaker_volume};
+use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xff;
@@ -65,6 +69,19 @@ impl DeviceSession {
         self.owner.control
     }
 
+    /// Sets the main speaker level using the reference-derived Audient request.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails.
+    pub async fn set_speaker_level(&mut self, level: NormalizedLevel) -> Result<(), SessionError> {
+        let request = speaker_volume(level, self.control_interface().number);
+        self.owner.send(&request).await
+    }
+
     /// Releases the control interface and closes the session.
     ///
     /// # Errors
@@ -92,7 +109,7 @@ where
     transport: T,
     model: &'static DeviceModel,
     control: ControlInterface,
-    handle: Option<T::Handle>,
+    handle: T::Handle,
 }
 
 impl<T> SessionOwner<T>
@@ -106,16 +123,16 @@ where
             transport,
             model: selected.model,
             control: acquired.control,
-            handle: Some(acquired.handle),
+            handle: acquired.handle,
         })
     }
 
-    async fn close(mut self) -> Result<(), T::Error> {
-        let Some(handle) = self.handle.take() else {
-            return Ok(());
-        };
+    async fn send(&mut self, request: &ControlRequest) -> Result<(), T::Error> {
+        self.transport.send(&self.handle, request).await
+    }
 
-        self.transport.release(handle, self.control).await
+    async fn close(self) -> Result<(), T::Error> {
+        self.transport.release(self.handle, self.control).await
     }
 }
 
@@ -137,6 +154,12 @@ trait SessionTransport: Send + Sync {
         &self,
         handle: Self::Handle,
         control: ControlInterface,
+    ) -> Result<(), Self::Error>;
+
+    async fn send(
+        &self,
+        handle: &Self::Handle,
+        request: &ControlRequest,
     ) -> Result<(), Self::Error>;
 }
 
@@ -204,6 +227,27 @@ impl SessionTransport for UsbTransport {
                 source,
             })
     }
+
+    async fn send(
+        &self,
+        interface: &Self::Handle,
+        request: &ControlRequest,
+    ) -> Result<(), Self::Error> {
+        interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: request.request,
+                    value: request.value,
+                    index: request.index,
+                    data: &request.payload,
+                },
+                Duration::from_millis(250),
+            )
+            .await
+            .map_err(SessionError::Transfer)
+    }
 }
 
 fn matches_selection(
@@ -225,6 +269,7 @@ pub enum SessionError {
     NoSafeControlInterface { product_id: u16 },
     Open(nusb::Error),
     Claim { interface: u8, source: nusb::Error },
+    Transfer(nusb::transfer::TransferError),
     Release { interface: u8, source: nusb::Error },
 }
 
@@ -249,6 +294,10 @@ impl SessionError {
             | Self::Open(source)
             | Self::Claim { source, .. }
             | Self::Release { source, .. } => classify_nusb_error(source.kind()),
+            Self::Transfer(nusb::transfer::TransferError::Disconnected) => {
+                SessionErrorKind::Disconnected
+            }
+            Self::Transfer(_) => SessionErrorKind::Other,
         }
     }
 
@@ -301,6 +350,7 @@ impl Display for SessionError {
                     "could not claim control interface {interface}: {source}"
                 )
             }
+            Self::Transfer(source) => write!(formatter, "Audient control request failed: {source}"),
             Self::Release { interface, source } => {
                 write!(
                     formatter,
@@ -318,6 +368,7 @@ impl Error for SessionError {
             | Self::Open(source)
             | Self::Claim { source, .. }
             | Self::Release { source, .. } => Some(source),
+            Self::Transfer(source) => Some(source),
             Self::NotFound { .. } | Self::NoSafeControlInterface { .. } => None,
         }
     }
@@ -360,11 +411,13 @@ mod tests {
         SessionErrorKind, SessionOwner, SessionTransport, classify_nusb_error,
         select_control_interface,
     };
+    use crate::device::protocol::ControlRequest;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockError {
         Acquire,
         Release,
+        Send,
     }
 
     #[derive(Default)]
@@ -372,12 +425,14 @@ mod tests {
         acquisitions: usize,
         releases: usize,
         handles_dropped: usize,
+        sends: usize,
     }
 
     struct MockTransport {
         state: Arc<Mutex<MockState>>,
         acquire_error: bool,
         release_error: bool,
+        send_error: bool,
     }
 
     struct MockHandle(Arc<Mutex<MockState>>);
@@ -424,6 +479,20 @@ mod tests {
 
             if self.release_error {
                 Err(MockError::Release)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn send(
+            &self,
+            _handle: &Self::Handle,
+            _request: &ControlRequest,
+        ) -> Result<(), Self::Error> {
+            self.state.lock().unwrap().sends += 1;
+
+            if self.send_error {
+                Err(MockError::Send)
             } else {
                 Ok(())
             }
@@ -490,6 +559,46 @@ mod tests {
         assert_eq!(state.handles_dropped, 1);
     }
 
+    #[test]
+    fn send_routes_one_request_without_releasing() {
+        use crate::device::NormalizedLevel;
+        use crate::device::protocol::speaker_volume;
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport_with_send_error(&state, false),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        let request = speaker_volume(NormalizedLevel::new(0.5).unwrap(), 4);
+        assert_eq!(block_on(owner.send(&request)), Ok(()));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sends, 1);
+        assert_eq!(state.releases, 0);
+    }
+
+    #[test]
+    fn send_failure_is_returned_without_releasing() {
+        use crate::device::NormalizedLevel;
+        use crate::device::protocol::speaker_volume;
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport_with_send_error(&state, true),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        let request = speaker_volume(NormalizedLevel::new(0.5).unwrap(), 4);
+        assert_eq!(block_on(owner.send(&request)), Err(MockError::Send));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sends, 1);
+        assert_eq!(state.releases, 0);
+    }
+
     fn mock_transport(
         state: &Arc<Mutex<MockState>>,
         acquire_error: bool,
@@ -499,6 +608,19 @@ mod tests {
             state: Arc::clone(state),
             acquire_error,
             release_error,
+            send_error: false,
+        }
+    }
+
+    fn mock_transport_with_send_error(
+        state: &Arc<Mutex<MockState>>,
+        send_error: bool,
+    ) -> MockTransport {
+        MockTransport {
+            state: Arc::clone(state),
+            acquire_error: false,
+            release_error: false,
+            send_error,
         }
     }
 
