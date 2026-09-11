@@ -30,13 +30,13 @@ MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue =
 SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored --exact sends_harmless_speaker_volume_request
 ```
 
-Treat this mapping as reference-derived until that check succeeds on the target model. It lowers the speaker level; run it only when that is safe for the connected setup.
+Treat this mapping as reference-derived until the audible change is confirmed on speakers. It lowers the speaker level; run it only when that is safe for the connected setup. Transfer acceptance was verified on an iD14 MKII on 2026-09-11 (see table); the audible level change itself is unconfirmed because that setup has headphones only and no speakers.
 
 ## Hardware verification
 
 | Date | Model | USB identity | Verification | Result |
 | --- | --- | --- | --- | --- |
 | 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Claim and release application interface 4 without sending a control payload | Passed; audio interfaces 0–2 remained bound to `snd-usb-audio`, and PipeWire and ALSA still exposed playback and capture afterward |
-| TBD | iD14 MKII | `2708:0008` | Send reference-derived speaker volume `0.1` via `sends_harmless_speaker_volume_request` | TBD — maintainer to fill after hardware run |
+| 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Send speaker volume `0.1` via `sends_harmless_speaker_volume_request` | Passed transfer; audio interfaces 0–2 remained bound to `snd-usb-audio`, and PipeWire still exposed playback and capture afterward. Audible change unconfirmed — headphones-only setup, no speakers connected |
 
 The device release comes from the USB descriptor and is not confirmed to be the user-facing firmware version.

@@ -48,7 +48,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app can send reference-derived speaker volume from the UI through a serialized background task that claims and releases the control interface per send, with pending, sent, and failed states and no state readback. The volume mapping has not been hardware-verified yet: the opt-in `sends_harmless_speaker_volume_request` check is still awaiting a physical run, so Milestone 1 is not closed. A safe claim-and-release cycle has been physically verified on an iD14 MKII without disturbing its Linux audio interfaces; broader connect, disconnect, shutdown, and failure testing is still required.
+The app can send reference-derived speaker volume from the UI through a serialized background task that claims and releases the control interface per send, with pending, sent, and failed states and no state readback. The volume request transfer was verified on an iD14 MKII without disturbing its Linux audio interfaces, but the audible change is unconfirmed (headphones-only setup), so the mapping stays reference-derived. A safe claim-and-release cycle was also physically verified on the same model; broader connect, disconnect, shutdown, and failure testing is still required, so Milestone 1 is not closed.
 
 ## Milestone 1 — Safe device session
 
@@ -60,7 +60,7 @@ The app can send reference-derived speaker volume from the UI through a serializ
 - Keep device I/O serialized and away from Iced's UI thread. ✅
 - Distinguish permission denied, device busy, disconnected, and unsupported-interface errors. ✅
 - Introduce a mockable transport boundary and test acquisition and cleanup failures. ✅
-- Send one harmless, bounded control request on the maintainer's first test model.
+- Send one harmless, bounded control request on the maintainer's first test model. ✅
 
 **Exit condition:** repeated connect, disconnect, application-close, and forced-error tests leave PipeWire or ALSA audio working normally on the first target model.
 
