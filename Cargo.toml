@@ -1,0 +1,18 @@
+[package]
+name = "selah"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+iced_aw = "0.13"
+nusb = "0.2"
+tray-icon = "0.19"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
+ctrlc = "3"
