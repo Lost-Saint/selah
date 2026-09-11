@@ -24,12 +24,19 @@ Control-request execution is not enabled yet. Add verified request details here 
 
 ### Reference-derived speaker volume
 
-MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue = 0x1200`, an output entity of `0x36`, and a two-byte little-endian signed value mapping normalized `0.0..=1.0` to `-32768..=-1`. Selah encodes this request as pure data and validates the input range, but has not sent it to hardware yet. Treat this mapping as reference-derived until the opt-in iD14 MKII check succeeds.
+MixiD sends speaker volume as a class/interface `SET_CUR` request with `wValue = 0x1200`, an output entity of `0x36`, and a two-byte little-endian signed value mapping normalized `0.0..=1.0` to `-32768..=-1`. Selah encodes this request as pure data and validates the input range. The opt-in hardware check `sends_harmless_speaker_volume_request` opens a safe session, sends level `0.1`, and closes the session:
+
+```sh
+SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored --exact sends_harmless_speaker_volume_request
+```
+
+Treat this mapping as reference-derived until that check succeeds on the target model. It lowers the speaker level; run it only when that is safe for the connected setup.
 
 ## Hardware verification
 
 | Date | Model | USB identity | Verification | Result |
 | --- | --- | --- | --- | --- |
 | 2026-09-11 | iD14 MKII | `2708:0008`, device release `0x0112` | Claim and release application interface 4 without sending a control payload | Passed; audio interfaces 0–2 remained bound to `snd-usb-audio`, and PipeWire and ALSA still exposed playback and capture afterward |
+| TBD | iD14 MKII | `2708:0008` | Send reference-derived speaker volume `0.1` via `sends_harmless_speaker_volume_request` | TBD — maintainer to fill after hardware run |
 
 The device release comes from the USB descriptor and is not confirmed to be the user-facing firmware version.

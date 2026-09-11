@@ -1,4 +1,4 @@
-use selah::device::{DeviceSession, discover};
+use selah::device::{DetectedDevice, DeviceSession, NormalizedLevel, discover};
 
 const PRODUCT_ID_ENV: &str = "SELAH_HARDWARE_PRODUCT_ID";
 
@@ -12,7 +12,46 @@ fn opens_and_closes_selected_safe_interface() {
         .block_on(check_session());
 }
 
+#[test]
+#[ignore = "claims a physical device; set SELAH_HARDWARE_PRODUCT_ID and run explicitly"]
+fn sends_harmless_speaker_volume_request() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Tokio runtime should start")
+        .block_on(check_speaker_volume());
+}
+
 async fn check_session() {
+    let selected = select_single_device().await;
+
+    let session = DeviceSession::open(&selected)
+        .await
+        .expect("safe session should open");
+    session
+        .close()
+        .await
+        .expect("safe session should close cleanly");
+}
+
+async fn check_speaker_volume() {
+    let selected = select_single_device().await;
+
+    let mut session = DeviceSession::open(&selected)
+        .await
+        .expect("safe session should open");
+    let level = NormalizedLevel::new(0.1).expect("0.1 is a valid mixer level");
+    session
+        .set_speaker_level(level)
+        .await
+        .expect("speaker volume request should succeed");
+    session
+        .close()
+        .await
+        .expect("safe session should close cleanly");
+}
+
+async fn select_single_device() -> DetectedDevice {
     let expected_product_id = std::env::var(PRODUCT_ID_ENV).unwrap_or_else(|_| {
         panic!("set {PRODUCT_ID_ENV} to the four-digit hexadecimal USB product ID")
     });
@@ -45,11 +84,5 @@ async fn check_session() {
         "the selected device must expose a non-audio control interface"
     );
 
-    let session = DeviceSession::open(selected)
-        .await
-        .expect("safe session should open");
-    session
-        .close()
-        .await
-        .expect("safe session should close cleanly");
+    selected.clone()
 }
