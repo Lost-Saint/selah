@@ -46,6 +46,14 @@ SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored -
 
 Treat this mapping as reference-derived until the audible change is confirmed on headphones. It sets the headphone level; run it only when that is safe for the connected setup. One known limitation from BiD's measurements: on a cue-fed phones output the `0x0c` headphone gain made no audible difference, and the Main-Mix-fed case is untested there — so audibility may also depend on what the phones output is currently routed to, which Selah cannot see yet.
 
+### Reference-derived phones-to-Main-Mix routing
+
+MixiD `set_routing_value` (driver.h) routes one channel with `wValue = chanVals[chan]`, entity `0x33`, and a one-byte destination from `routeToggle[chan]`. Selah encodes phones-to-Main-Mix as the two HP-pair rows in order on one session: `0x0604 → 0x1b` (HP L to Main Mix) and `0x0605 → 0x1c` (HP R to Main Mix), stopping on a first-transfer failure so the pair cannot mismatch silently.
+
+The UI button sends both bounded requests through a background task that opens a safe session, sends, and closes the session. This is one-way with no readback and no restore: the status line reports only what was sent. The action is gated to the iD14 MKII (`0x0008`) because MixiD's six-channel table matches that layout and larger ADAT models likely differ; do not widen without per-model hardware evidence.
+
+Treat this mapping as reference-derived until a listening test confirms the phones are on Main Mix and the existing volume controls become audible. It changes the audible path; run it only when that is safe for the connected setup.
+
 ## Hardware verification
 
 | Date | Model | USB identity | Verification | Result |

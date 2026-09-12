@@ -3,9 +3,10 @@ use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 
 use crate::device::{
     DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, UnknownAudientDevice,
-    discover, send_headphone_level, send_speaker_level, watch_events,
+    discover, send_headphone_level, send_phones_to_main_mix, send_speaker_level, watch_events,
 };
 use crate::monitor::{VolumeControl, monitor_controls_available};
+use crate::routing::{RouteControl, phones_main_mix_available};
 
 struct App {
     status: DeviceStatus,
@@ -14,6 +15,7 @@ struct App {
     watch_status: WatchStatus,
     speaker: VolumeControl,
     headphone: VolumeControl,
+    routing: RouteControl,
 }
 
 /// Outcome of one background speaker-volume send, paired with the level it
@@ -41,6 +43,8 @@ enum Message {
     SpeakerVolumeFinished(SpeakerVolumeOutcome),
     HeadphoneVolumeChanged(f32),
     HeadphoneVolumeFinished(HeadphoneVolumeOutcome),
+    RoutePhonesToMainMix,
+    RoutingFinished(Result<(), String>),
 }
 
 enum DeviceStatus {
@@ -77,6 +81,7 @@ impl App {
                 watch_status: WatchStatus::Starting,
                 speaker: VolumeControl::default(),
                 headphone: VolumeControl::default(),
+                routing: RouteControl::default(),
             },
             Task::none(),
         )
@@ -107,6 +112,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Ready(report);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.routing = RouteControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
@@ -117,6 +123,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Unsupported(report);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.routing = RouteControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(_)) => {
@@ -124,6 +131,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Empty;
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.routing = RouteControl::default();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Err(error)) => {
@@ -131,12 +139,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Failed(error);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.routing = RouteControl::default();
             finish_scan(app)
         }
         Message::SpeakerVolumeChanged(level) => request_speaker_volume(app, level),
         Message::SpeakerVolumeFinished(outcome) => finish_speaker_volume(app, outcome),
         Message::HeadphoneVolumeChanged(level) => request_headphone_volume(app, level),
         Message::HeadphoneVolumeFinished(outcome) => finish_headphone_volume(app, outcome),
+        Message::RoutePhonesToMainMix => request_routing(app),
+        Message::RoutingFinished(result) => finish_routing(app, result),
     }
 }
 
@@ -218,6 +229,35 @@ fn finish_headphone_volume(app: &mut App, outcome: HeadphoneVolumeOutcome) -> Ta
     }
 }
 
+/// Starts a one-way phones-to-Main-Mix send; ignored while one is in flight.
+///
+/// The USB work runs in the returned task, away from Iced's UI thread.
+fn request_routing(app: &mut App) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+
+    match app.routing.request() {
+        Some(()) => routing_task(device),
+        None => Task::none(),
+    }
+}
+
+/// Records a routing send result; stale completions after a rescan are ignored.
+fn finish_routing(app: &mut App, result: Result<(), String>) -> Task<Message> {
+    if !app.routing.is_sending() {
+        return Task::none();
+    }
+
+    match &result {
+        Ok(()) => tracing::info!("Phones routed to Main Mix"),
+        Err(error) => tracing::warn!(%error, "Phones routing send failed"),
+    }
+
+    app.routing.finish(result);
+    Task::none()
+}
+
 /// The first supported device, matching what `supported_view` displays.
 fn selected_device(app: &App) -> Option<DetectedDevice> {
     match &app.status {
@@ -247,6 +287,13 @@ fn headphone_task(device: DetectedDevice, level: f32) -> Task<Message> {
             }
         },
         Message::HeadphoneVolumeFinished,
+    )
+}
+
+fn routing_task(device: DetectedDevice) -> Task<Message> {
+    Task::perform(
+        async move { send_phones_to_main_mix(device).await },
+        Message::RoutingFinished,
     )
 }
 
@@ -297,7 +344,7 @@ fn view(app: &App) -> Element<'_, Message> {
         text("Selah").size(24),
         space().width(Length::Fill),
         container(
-            text("Write-only volume · no readback")
+            text("Write-only · no readback")
                 .size(13)
                 .style(text::secondary)
         )
@@ -310,12 +357,17 @@ fn view(app: &App) -> Element<'_, Message> {
         header,
         column![
             text("Find your interface").size(36),
-            text("Discovery only reads USB descriptors. Each volume send briefly claims a safe control interface, then releases it.")
+            text("Discovery only reads USB descriptors. Each send briefly claims a safe control interface, then releases it.")
                 .size(16)
                 .style(text::secondary),
         ]
         .spacing(8),
-        container(status_view(&app.status, &app.speaker, &app.headphone))
+        container(status_view(
+            &app.status,
+            &app.speaker,
+            &app.headphone,
+            &app.routing
+        ))
             .width(Fill)
             .padding(28)
             .style(container::rounded_box),
@@ -345,6 +397,7 @@ fn status_view<'a>(
     status: &'a DeviceStatus,
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
+    routing: &'a RouteControl,
 ) -> Element<'a, Message> {
     match status {
         DeviceStatus::Scanning => column![
@@ -365,7 +418,7 @@ fn status_view<'a>(
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone),
+        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone, routing),
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -382,6 +435,7 @@ fn supported_view<'a>(
     report: &'a DiscoveryReport,
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
+    routing: &'a RouteControl,
 ) -> Element<'a, Message> {
     let device = &report.supported[0];
     let model = device.model;
@@ -429,6 +483,12 @@ fn supported_view<'a>(
         ));
     }
 
+    // One-way and iD14 MKII-only: MixiD's six-channel table matches that
+    // layout, and Selah cannot read routing back or restore the old route.
+    if phones_main_mix_available(device) {
+        content = content.push(routing_button(routing));
+    }
+
     if let Some(extra) = extra {
         content = content.push(text(extra).size(13).style(text::secondary));
     }
@@ -450,6 +510,23 @@ fn volume_slider<'a>(
         text(title).size(16),
         slider(0.0..=1.0, control.position(), on_change).step(0.01_f32),
         text(control.status_text()).size(13).style(text::secondary),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// One-way phones-to-Main-Mix action without implying confirmed device state.
+///
+/// Selah cannot read routing back, so the button reports what was sent —
+/// never what the device is confirmed to hold — and warns that it cannot be
+/// undone from here.
+fn routing_button(routing: &RouteControl) -> Element<'_, Message> {
+    let sending = matches!(routing.status(), crate::routing::RouteStatus::Sending);
+    column![
+        text("Phones routing").size(16),
+        button(text("Route phones to Main Mix"))
+            .on_press_maybe((!sending).then_some(Message::RoutePhonesToMainMix)),
+        text(routing.status_text()).size(13).style(text::secondary),
     ]
     .spacing(8)
     .into()

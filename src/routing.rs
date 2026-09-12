@@ -53,12 +53,9 @@ impl RouteControl {
             RouteStatus::Failed { error, .. } => {
                 format!("Route send failed: {error} Try again.")
             }
-            RouteStatus::Sent => {
-                "Last route sent — not read back from the device.".to_owned()
-            }
+            RouteStatus::Sent => "Last route sent — not read back from the device.".to_owned(),
             RouteStatus::Unknown => {
-                "No route read from the device — this sends once and cannot be undone."
-                    .to_owned()
+                "No route read from the device — this sends once and cannot be undone.".to_owned()
             }
         }
     }
@@ -105,7 +102,7 @@ impl RouteControl {
 
 /// Whether the phones-to-Main-Mix action can be offered for this attachment.
 ///
-/// Gated to the iD14 MKII (`0x0008`): MixiD's six-channel route table matches
+/// Gated to the iD14 MKII (`0x0008`): `MixiD`'s six-channel route table matches
 /// that layout, and larger ADAT models likely differ. Do not widen without
 /// per-model hardware evidence.
 #[must_use]
