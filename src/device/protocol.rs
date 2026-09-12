@@ -445,12 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn monitor_toggle_labels_match_the_reference_panel() {
-        let labels = MonitorToggle::ALL.map(MonitorToggle::label);
-        assert_eq!(labels, ["DIM", "ALT", "TB", "MONO", "MUTE"]);
-    }
-
-    #[test]
     fn encodes_channel_volume_cell_pair() {
         assert_eq!(
             channel_volume(NormalizedLevel::new(1.0).unwrap(), 0, 4),

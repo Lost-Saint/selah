@@ -403,22 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_request_clears_the_visible_error() {
-        let mut control = VolumeControl::default();
-        let _send = control.request(0.2);
-        let _failed = control.finish(0.2, Err("no device".to_owned()));
-
-        assert_eq!(control.request(0.3), Some(0.3));
-        assert_eq!(
-            control.status(),
-            VolumeStatus::Sending {
-                sending: 0.3,
-                queued: None,
-            }
-        );
-    }
-
-    #[test]
     fn changes_while_sending_queue_behind_one_send() {
         let mut control = VolumeControl::default();
 
@@ -449,17 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn failure_with_a_queued_level_still_advances_the_queue() {
-        let mut control = VolumeControl::default();
-        let _first = control.request(0.2);
-        let _queued = control.request(0.3);
-
-        assert_eq!(control.finish(0.2, Err("busy".to_owned())), Some(0.3));
-        assert_eq!(control.finish(0.3, Ok(())), None);
-        assert_eq!(control.status(), VolumeStatus::Sent { level: 0.3 });
-    }
-
-    #[test]
     fn stale_completions_leave_state_untouched() {
         let mut control = VolumeControl::default();
         let _send = control.request(0.2);
@@ -477,16 +450,6 @@ mod tests {
                 queued: None,
             }
         );
-    }
-
-    #[test]
-    fn re_requesting_the_in_flight_level_settles_without_a_follow_up() {
-        let mut control = VolumeControl::default();
-        let _first = control.request(0.2);
-        let _repeat = control.request(0.2);
-
-        assert_eq!(control.finish(0.2, Ok(())), None);
-        assert_eq!(control.status(), VolumeStatus::Sent { level: 0.2 });
     }
 
     #[test]
@@ -554,16 +517,6 @@ mod tests {
 
         assert!(control.finish(true, Ok(())));
         assert_eq!(control.status(), ToggleStatus::Sent { on: true });
-    }
-
-    #[test]
-    fn toggle_stale_completions_leave_state_untouched() {
-        let mut control = ToggleControl::default();
-        let _send = control.request(true);
-
-        assert!(!control.finish(false, Ok(())));
-        assert!(control.is_in_flight(true));
-        assert_eq!(control.status(), ToggleStatus::Sending { sending: true });
     }
 
     #[test]

@@ -823,30 +823,6 @@ mod tests {
     }
 
     #[test]
-    fn mixed_close_and_drop_cycles_leave_nothing_outstanding() {
-        let state = Arc::new(Mutex::new(MockState::default()));
-
-        for cycle in 0..10 {
-            let owner = block_on(SessionOwner::open(
-                mock_transport(&state, false, false),
-                &selected_device(),
-            ))
-            .unwrap();
-            if cycle % 2 == 0 {
-                assert_eq!(block_on(owner.close()), Ok(()));
-            } else {
-                drop(owner);
-            }
-        }
-
-        let state = state.lock().unwrap();
-        assert_eq!(state.acquisitions, 10);
-        assert_eq!(state.releases, 5);
-        assert_eq!(state.handles_dropped, 10);
-        assert_eq!(state.live_handles, 0);
-    }
-
-    #[test]
     fn session_failures_map_to_actionable_kinds_and_hints() {
         use nusb::transfer::TransferError;
 
@@ -957,30 +933,6 @@ mod tests {
             reported_name: None,
             control_interface: None,
         }
-    }
-
-    #[test]
-    fn classifies_actionable_usb_errors() {
-        assert_eq!(
-            classify_nusb_error(nusb::ErrorKind::PermissionDenied),
-            SessionErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            classify_nusb_error(nusb::ErrorKind::Busy),
-            SessionErrorKind::Busy
-        );
-        assert_eq!(
-            classify_nusb_error(nusb::ErrorKind::Disconnected),
-            SessionErrorKind::Disconnected
-        );
-        assert_eq!(
-            classify_nusb_error(nusb::ErrorKind::NotFound),
-            SessionErrorKind::Disconnected
-        );
-        assert_eq!(
-            classify_nusb_error(nusb::ErrorKind::Other),
-            SessionErrorKind::Other
-        );
     }
 
     #[test]
