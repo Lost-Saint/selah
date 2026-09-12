@@ -1,34 +1,37 @@
 //! Monitor volume state for one output.
 //!
-//! A [`VolumeControl`] tracks what the user last requested and what the
-//! device last acknowledged. Selah cannot read levels back from the
-//! hardware, so the slider position is never presented as confirmed device
-//! state; [`VolumeStatus`] names the honest states instead.
+//! A [`VolumeControl`] tracks what the user last requested, what the device
+//! last acknowledged, and — where the protocol answers reads — what the
+//! hardware last confirmed. The slider position is never presented as
+//! confirmed device state; [`VolumeStatus`] names the honest states instead.
 
 use crate::device::DetectedDevice;
 
 /// Slider position and send state for one output volume.
 ///
-/// `position` is only what the user last requested. Selah has no state
-/// readback, so it is never presented as the device's confirmed level.
-/// `last_sent` records the most recent level the device acknowledged.
+/// `position` is only what the user last requested. `last_sent` records the
+/// most recent level the device acknowledged. `confirmed` is the level the
+/// device itself last reported through readback, and is the only value
+/// presented as hardware state.
 #[derive(Clone, Debug, Default)]
 pub struct VolumeControl {
     position: f32,
     in_flight: Option<f32>,
     queued: Option<f32>,
     last_sent: Option<f32>,
+    confirmed: Option<f32>,
     last_error: Option<String>,
 }
 
 /// The honest, nameable state of one volume control.
 ///
-/// There is no confirmed-device state: without readback, the best Selah can
-/// say is what was sent, what is sending, what failed, or that nothing is
-/// known yet.
+/// `Confirmed` means the device reported the level through readback: it is
+/// authoritative until the device disconnects. `Sent` means a write was
+/// acknowledged but never read back, so it must not be mistaken for
+/// hardware state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VolumeStatus {
-    /// Nothing has been sent yet; the device level is unknown.
+    /// Nothing has been sent or read yet; the device level is unknown.
     Unknown,
     /// A send is running, with the newest waiting level when one arrived
     /// while sending.
@@ -40,6 +43,10 @@ pub enum VolumeStatus {
         error: String,
         last_sent: Option<f32>,
     },
+    /// The device reported this level through readback. The UI adopts it,
+    /// so external changes (front panel, reconnect) appear instead of being
+    /// overwritten by stale local state.
+    Confirmed { level: f32 },
     /// The last send was acknowledged; still not read back from the device.
     Sent { level: f32 },
 }
@@ -54,17 +61,23 @@ impl VolumeControl {
     /// Names the current honest state of this control.
     #[must_use]
     pub fn status(&self) -> VolumeStatus {
-        match (self.in_flight, &self.last_error, self.last_sent) {
-            (Some(sending), _, _) => VolumeStatus::Sending {
+        match (
+            self.in_flight,
+            &self.last_error,
+            self.confirmed,
+            self.last_sent,
+        ) {
+            (Some(sending), _, _, _) => VolumeStatus::Sending {
                 sending,
                 queued: self.queued,
             },
-            (None, Some(error), _) => VolumeStatus::Failed {
+            (None, Some(error), _, _) => VolumeStatus::Failed {
                 error: error.clone(),
                 last_sent: self.last_sent,
             },
-            (None, None, Some(level)) => VolumeStatus::Sent { level },
-            (None, None, None) => VolumeStatus::Unknown,
+            (None, None, Some(level), _) => VolumeStatus::Confirmed { level },
+            (None, None, None, Some(level)) => VolumeStatus::Sent { level },
+            (None, None, None, None) => VolumeStatus::Unknown,
         }
     }
 
@@ -89,6 +102,12 @@ impl VolumeControl {
             }
             VolumeStatus::Failed { error, .. } => {
                 format!("Send failed: {error} Move the slider to retry.")
+            }
+            VolumeStatus::Confirmed { level } => {
+                format!(
+                    "Hardware reports {:.0}% — follows the device, not just this slider.",
+                    level * 100.0
+                )
             }
             VolumeStatus::Sent { level } => {
                 format!(
@@ -148,6 +167,10 @@ impl VolumeControl {
     /// and differs from the completed level. Stale completions leave the
     /// state untouched and return `None`.
     ///
+    /// A successful send clears the previous hardware confirmation: the
+    /// device now holds the new level, so the old confirmed value would be
+    /// stale. The next readback confirms the new level.
+    ///
     /// Levels here are compared exactly because they are copied slider values
     /// used as request identities, not computed arithmetic.
     #[allow(clippy::float_cmp, reason = "copied slider levels identify requests")]
@@ -160,6 +183,7 @@ impl VolumeControl {
         match result {
             Ok(()) => {
                 self.last_sent = Some(level);
+                self.confirmed = None;
                 self.last_error = None;
             }
             Err(error) => {
@@ -181,6 +205,32 @@ impl VolumeControl {
         self.in_flight = None;
         self.queued = None;
     }
+
+    /// Adopts a hardware-reported level as the confirmed device state.
+    ///
+    /// The slider position follows the hardware so external changes (front
+    /// panel, another control path, reconnect) appear instead of being
+    /// overwritten by stale local state. A control with a send in flight
+    /// keeps its pending position: the local operation wins transiently,
+    /// and the next readback after it completes becomes authoritative.
+    ///
+    /// Returns whether the confirmed value changed, so callers can skip
+    /// redundant logging and UI work when the device reports the same level.
+    ///
+    /// Levels here are compared exactly because they are copied device
+    /// values used as state identities, not computed arithmetic.
+    #[allow(clippy::float_cmp, reason = "copied device levels identify state")]
+    #[must_use]
+    pub fn apply_confirmed(&mut self, level: f32) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let level = level.clamp(0.0, 1.0);
+        let changed = self.confirmed != Some(level);
+        self.confirmed = Some(level);
+        self.position = level;
+        changed
+    }
 }
 
 /// Whether monitor volume controls can be offered for this attachment.
@@ -194,22 +244,38 @@ pub fn monitor_controls_available(device: &DetectedDevice) -> bool {
     device.control_interface.is_some()
 }
 
+/// Whether the speaker level can be read back from this attachment.
+///
+/// The monitor volume node answers `GET_CUR` (`BiD` `get_monitor_volume`),
+/// and the entity map is shared family-wide, so readback follows the same
+/// gate as the volume writes. Headphone level has no such gate: its reads
+/// alias or stall, so it stays write-only and unknown until read back.
+#[must_use]
+pub fn speaker_feedback_available(device: &DetectedDevice) -> bool {
+    monitor_controls_available(device)
+}
+
 /// Send state for one monitor toggle (dim, mute, mono, alt, talkback).
 ///
-/// Like volumes and routing, Selah cannot read toggles back: `position` is
-/// only the last requested on/off value, never confirmed device state.
+/// `position` is only the last requested on/off value. `confirmed` is the
+/// value the device itself last reported through readback, and is the only
+/// value presented as hardware state.
 #[derive(Clone, Debug, Default)]
 pub struct ToggleControl {
     position: bool,
     in_flight: Option<bool>,
     last_sent: Option<bool>,
+    confirmed: Option<bool>,
     last_error: Option<String>,
 }
 
 /// The honest, nameable state of one monitor toggle.
+///
+/// `Confirmed` means the device reported the value through readback and the
+/// UI adopted it. `Sent` means a write was acknowledged but never read back.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToggleStatus {
-    /// Nothing has been sent yet; the device state is unknown.
+    /// Nothing has been sent or read yet; the device state is unknown.
     Unknown,
     /// A send is running.
     Sending { sending: bool },
@@ -220,6 +286,8 @@ pub enum ToggleStatus {
         error: String,
         last_sent: Option<bool>,
     },
+    /// The device reported this value through readback; the UI adopted it.
+    Confirmed { on: bool },
     /// The last send was acknowledged; still not read back from the device.
     Sent { on: bool },
 }
@@ -234,14 +302,20 @@ impl ToggleControl {
     /// Names the current honest state of this control.
     #[must_use]
     pub fn status(&self) -> ToggleStatus {
-        match (self.in_flight, &self.last_error, self.last_sent) {
-            (Some(sending), _, _) => ToggleStatus::Sending { sending },
-            (None, Some(error), _) => ToggleStatus::Failed {
+        match (
+            self.in_flight,
+            &self.last_error,
+            self.confirmed,
+            self.last_sent,
+        ) {
+            (Some(sending), _, _, _) => ToggleStatus::Sending { sending },
+            (None, Some(error), _, _) => ToggleStatus::Failed {
                 error: error.clone(),
                 last_sent: self.last_sent,
             },
-            (None, None, Some(on)) => ToggleStatus::Sent { on },
-            (None, None, None) => ToggleStatus::Unknown,
+            (None, None, Some(on), _) => ToggleStatus::Confirmed { on },
+            (None, None, None, Some(on)) => ToggleStatus::Sent { on },
+            (None, None, None, None) => ToggleStatus::Unknown,
         }
     }
 
@@ -254,6 +328,12 @@ impl ToggleControl {
             }
             ToggleStatus::Failed { error, .. } => {
                 format!("Send failed: {error} Press again to retry.")
+            }
+            ToggleStatus::Confirmed { on } => {
+                format!(
+                    "Hardware reports {} — follows the device.",
+                    if on { "on" } else { "off" }
+                )
             }
             ToggleStatus::Sent { on } => {
                 format!(
@@ -292,6 +372,10 @@ impl ToggleControl {
 
     /// Records a background send result. Stale completions leave the state
     /// untouched.
+    ///
+    /// A successful send clears the previous hardware confirmation: the
+    /// device now holds the new value, so the old confirmed value would be
+    /// stale. The next readback confirms the new value.
     #[must_use]
     pub fn finish(&mut self, on: bool, result: Result<(), String>) -> bool {
         if self.in_flight != Some(on) {
@@ -301,6 +385,7 @@ impl ToggleControl {
         match result {
             Ok(()) => {
                 self.last_sent = Some(on);
+                self.confirmed = None;
                 self.last_error = None;
             }
             Err(error) => {
@@ -310,6 +395,25 @@ impl ToggleControl {
 
         self.in_flight = None;
         true
+    }
+
+    /// Adopts a hardware-reported value as the confirmed device state.
+    ///
+    /// The position follows the hardware so external changes appear instead
+    /// of being overwritten by stale local state. A toggle with a send in
+    /// flight keeps its pending value; the next readback after it completes
+    /// becomes authoritative.
+    ///
+    /// Returns whether the confirmed value changed.
+    #[must_use]
+    pub fn apply_confirmed(&mut self, on: bool) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let changed = self.confirmed != Some(on);
+        self.confirmed = Some(on);
+        self.position = on;
+        changed
     }
 }
 
@@ -321,6 +425,15 @@ impl ToggleControl {
 #[must_use]
 pub fn monitor_toggles_available(device: &DetectedDevice) -> bool {
     device.control_interface.is_some() && device.model.product_id == 0x0008
+}
+
+/// Whether monitor toggles can be read back from this attachment.
+///
+/// The monitor entity answers `GET_CUR` for these selectors (`BiD`
+/// `get_bool_state`), so readback follows the same gate as the writes.
+#[must_use]
+pub fn toggle_feedback_available(device: &DetectedDevice) -> bool {
+    monitor_toggles_available(device)
 }
 
 #[cfg(test)]
@@ -469,6 +582,75 @@ mod tests {
     fn availability_follows_the_safe_control_interface() {
         assert!(monitor_controls_available(&device_with_control(true)));
         assert!(!monitor_controls_available(&device_with_control(false)));
+    }
+
+    #[test]
+    fn confirmed_hardware_state_beats_last_sent_but_not_failure() {
+        use super::speaker_feedback_available;
+
+        let mut control = VolumeControl::default();
+        assert_eq!(control.status(), VolumeStatus::Unknown);
+
+        // A readback adopts the hardware value and moves the slider to it.
+        assert!(control.apply_confirmed(0.7));
+        assert_level_eq(control.position(), 0.7);
+        assert_eq!(control.status(), VolumeStatus::Confirmed { level: 0.7 });
+        // Repeating the same hardware value reports no change.
+        assert!(!control.apply_confirmed(0.7));
+
+        // A later local send is pending, not confirmed; the old hardware
+        // value stays recorded underneath but is not shown as current.
+        assert_eq!(control.request(0.2), Some(0.2));
+        assert_level_eq(control.position(), 0.2);
+        assert!(!control.apply_confirmed(0.9));
+        assert_level_eq(control.position(), 0.2);
+        assert_eq!(
+            control.status(),
+            VolumeStatus::Sending {
+                sending: 0.2,
+                queued: None,
+            }
+        );
+
+        // The acknowledged send is still not hardware state; the next
+        // readback confirms it.
+        assert_eq!(control.finish(0.2, Ok(())), None);
+        assert_eq!(control.status(), VolumeStatus::Sent { level: 0.2 });
+        assert!(control.apply_confirmed(0.2));
+        assert_eq!(control.status(), VolumeStatus::Confirmed { level: 0.2 });
+
+        assert!(speaker_feedback_available(&device_with_control(true)));
+        assert!(!speaker_feedback_available(&device_with_control(false)));
+    }
+
+    #[test]
+    fn toggle_confirmed_state_follows_the_device() {
+        use super::toggle_feedback_available;
+
+        let mut control = ToggleControl::default();
+        assert!(control.apply_confirmed(true));
+        assert!(control.position());
+        assert_eq!(control.status(), ToggleStatus::Confirmed { on: true });
+        assert!(!control.apply_confirmed(true));
+
+        // A pending local send is not overwritten by readback.
+        assert_eq!(control.request(false), Some(false));
+        assert!(!control.apply_confirmed(true));
+        assert!(!control.position());
+        assert!(control.finish(false, Ok(())));
+        assert_eq!(control.status(), ToggleStatus::Sent { on: false });
+        assert!(control.apply_confirmed(false));
+        assert_eq!(control.status(), ToggleStatus::Confirmed { on: false });
+
+        assert!(toggle_feedback_available(&device_with_product(
+            0x0008, true
+        )));
+        assert!(!toggle_feedback_available(&device_with_product(
+            0x000d, true
+        )));
+        assert!(!toggle_feedback_available(&device_with_product(
+            0x0008, false
+        )));
     }
 
     #[test]

@@ -6,6 +6,12 @@ use crate::routing::{
 };
 
 const SET_CURRENT: u8 = 0x01;
+// `GET_CUR` shares `bRequest 0x01` with `SET_CUR`; the IN direction lives in
+// `bmRequestType`, which `nusb` selects through its `control_in` call.
+const GET_CURRENT: u8 = 0x01;
+// Meters are a different request family: `GET_MEM`, answered as one block
+// for every input node rather than per channel (BiD `get_meters`).
+const GET_MEMORY: u8 = 0x03;
 const SPEAKER_VOLUME_CONTROL: u16 = 0x1200;
 const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
 // Headphone volume lives on feature unit `0x0c`, which carries four output
@@ -39,6 +45,11 @@ const MONITOR_TOGGLE_ENTITY: u16 = 0x3600;
 const MIXER_MATRIX_ENTITY: u16 = 0x3c00;
 const MIXER_MATRIX_SELECTOR_BASE: u16 = 0x0100;
 const MIXER_MATRIX_CELL_STRIDE: u16 = 6;
+// Input-node meter block: sixteen nodes of two bytes, the first byte of
+// each pair carrying the level (BiD `get_meters`).
+const METER_BLOCK_LENGTH: u16 = 32;
+/// How many input nodes one meter block can describe.
+pub const MAX_METER_INPUTS: u8 = 16;
 // Input polarity lives on entity `0x0b`: `MixiD` `set_phase_state`
 // writes a one-byte bool with `wValue = 0x0d01 + channel`.
 const POLARITY_ENTITY: u16 = 0x0b00;
@@ -268,11 +279,169 @@ pub(crate) fn digital_output_mode(mode: DigitalOutputMode, interface_number: u8)
     }
 }
 
+/// A device-to-host control read: the `GET_CUR` or `GET_MEM` counterpart of
+/// a [`ControlRequest`]. Only entities with reference evidence that reads
+/// answer truthfully have constructors here. The mixer matrix, routing
+/// table, channel polarity, and headphone volume read back aliased values
+/// or stall, so they stay write-only (see `docs/protocol.md`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ControlReadRequest {
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+}
+
+/// Reads the monitor volume node back: entity `0x36`, selector `0x12`, two
+/// bytes little-endian (`BiD` `get_monitor_volume`).
+pub(crate) fn speaker_volume_read(interface_number: u8) -> ControlReadRequest {
+    ControlReadRequest {
+        request: GET_CURRENT,
+        value: SPEAKER_VOLUME_CONTROL,
+        index: SPEAKER_OUTPUT_ENTITY | u16::from(interface_number),
+        length: 2,
+    }
+}
+
+/// Reads one monitor toggle back as the one-byte bool the device holds
+/// (`BiD` `get_bool_state`). The `wValue` matches the corresponding write.
+pub(crate) fn monitor_toggle_read(
+    toggle: MonitorToggle,
+    interface_number: u8,
+) -> ControlReadRequest {
+    ControlReadRequest {
+        request: GET_CURRENT,
+        value: toggle.control(),
+        index: MONITOR_TOGGLE_ENTITY | u16::from(interface_number),
+        length: 1,
+    }
+}
+
+/// Reads the evidenced iD24 optical-output mode back: entity `0x14`,
+/// selector `0x01`, four bytes little-endian (`BiD` `get_optical_mode`).
+pub(crate) fn digital_output_mode_read(interface_number: u8) -> ControlReadRequest {
+    ControlReadRequest {
+        request: GET_CURRENT,
+        value: DIGITAL_OUTPUT_MODE_CONTROL,
+        index: DIGITAL_OUTPUT_MODE_ENTITY | u16::from(interface_number),
+        length: 4,
+    }
+}
+
+/// Reads the whole input-node meter block at once: `GET_MEM` on entity
+/// `0x3c`, offset zero (`BiD` `get_meters`). Callers decode per-input levels
+/// with [`decode_meter_block`].
+pub(crate) fn meter_block_read(interface_number: u8) -> ControlReadRequest {
+    ControlReadRequest {
+        request: GET_MEMORY,
+        value: 0x0000,
+        index: MIXER_MATRIX_ENTITY | u16::from(interface_number),
+        length: METER_BLOCK_LENGTH,
+    }
+}
+
+/// A device response that cannot be trusted as the requested value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    /// The device answered with fewer (or more) bytes than the request asks
+    /// for. A short block is rejected rather than zero-filled.
+    ShortResponse { expected: u16, actual: usize },
+    /// The bytes arrived intact but name no valid value.
+    InvalidValue(&'static str),
+}
+
+impl Display for DecodeError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShortResponse { expected, actual } => write!(
+                formatter,
+                "device answered {actual} bytes, expected {expected}"
+            ),
+            Self::InvalidValue(detail) => {
+                write!(formatter, "device answered an invalid value: {detail}")
+            }
+        }
+    }
+}
+
+impl Error for DecodeError {}
+
+/// Decodes a two-byte little-endian level response into `0.0..=1.0`.
+///
+/// This inverts [`NormalizedLevel`]'s device mapping; values outside the
+/// volume range clamp instead of failing, matching the `BiD` reference.
+pub(crate) fn decode_level_response(bytes: &[u8]) -> Result<f32, DecodeError> {
+    if bytes.len() != 2 {
+        return Err(DecodeError::ShortResponse {
+            expected: 2,
+            actual: bytes.len(),
+        });
+    }
+    let raw = i16::from_le_bytes([bytes[0], bytes[1]]);
+    Ok(((f32::from(raw) + 32_768.0) / 32_767.0).clamp(0.0, 1.0))
+}
+
+/// Decodes a one-byte monitor-toggle response: any nonzero byte means on.
+pub(crate) fn decode_toggle_response(bytes: &[u8]) -> Result<bool, DecodeError> {
+    if bytes.len() != 1 {
+        return Err(DecodeError::ShortResponse {
+            expected: 1,
+            actual: bytes.len(),
+        });
+    }
+    Ok(bytes[0] != 0)
+}
+
+/// Decodes a four-byte optical-output mode response (`0` = ADAT,
+/// `1` = S/PDIF). Any other first byte is rejected, not guessed.
+pub(crate) fn decode_digital_output_mode_response(
+    bytes: &[u8],
+) -> Result<DigitalOutputMode, DecodeError> {
+    if bytes.len() != 4 {
+        return Err(DecodeError::ShortResponse {
+            expected: 4,
+            actual: bytes.len(),
+        });
+    }
+    match bytes[0] {
+        0 => Ok(DigitalOutputMode::Adat),
+        1 => Ok(DigitalOutputMode::Spdif),
+        _ => Err(DecodeError::InvalidValue(
+            "optical output mode is neither ADAT (0) nor S/PDIF (1)",
+        )),
+    }
+}
+
+/// Decodes the meter block into one level byte per input node.
+///
+/// `inputs` is the model's running input count, capped at
+/// [`MAX_METER_INPUTS`]. The block must arrive whole: a short block is
+/// rejected rather than padded with fake silence.
+pub(crate) fn decode_meter_block(bytes: &[u8], inputs: u8) -> Result<Vec<u8>, DecodeError> {
+    if inputs > MAX_METER_INPUTS {
+        return Err(DecodeError::InvalidValue(
+            "meter input count exceeds one block",
+        ));
+    }
+    if bytes.len() != usize::from(METER_BLOCK_LENGTH) {
+        return Err(DecodeError::ShortResponse {
+            expected: METER_BLOCK_LENGTH,
+            actual: bytes.len(),
+        });
+    }
+    Ok((0..inputs)
+        .map(|input| bytes[usize::from(input) * 2])
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRequest, MonitorToggle, NormalizedLevel, channel_polarity, channel_volume,
-        digital_output_mode, headphone_volume, monitor_toggle, output_route, speaker_volume,
+        ControlReadRequest, ControlRequest, DecodeError, MAX_METER_INPUTS, MonitorToggle,
+        NormalizedLevel, channel_polarity, channel_volume, decode_digital_output_mode_response,
+        decode_level_response, decode_meter_block, decode_toggle_response, digital_output_mode,
+        digital_output_mode_read, headphone_volume, meter_block_read, monitor_toggle,
+        monitor_toggle_read, output_route, speaker_volume, speaker_volume_read,
     };
     use crate::routing::{DigitalOutputMode, Route, RoutingDestination, RoutingSource};
 
@@ -485,5 +654,161 @@ mod tests {
             }
         );
         assert_eq!(channel_polarity(0, false, 4).payload, vec![0x00]);
+    }
+
+    #[test]
+    fn read_requests_mirror_their_write_addresses() {
+        assert_eq!(
+            speaker_volume_read(4),
+            ControlReadRequest {
+                request: 0x01,
+                value: 0x1200,
+                index: 0x3604,
+                length: 2,
+            }
+        );
+        assert_eq!(
+            monitor_toggle_read(MonitorToggle::Dim, 4),
+            ControlReadRequest {
+                request: 0x01,
+                value: 0x0500,
+                index: 0x3604,
+                length: 1,
+            }
+        );
+        assert_eq!(
+            digital_output_mode_read(4),
+            ControlReadRequest {
+                request: 0x01,
+                value: 0x0100,
+                index: 0x1404,
+                length: 4,
+            }
+        );
+        // Meters are the one block GET_MEM read, not a per-channel GET_CUR.
+        assert_eq!(
+            meter_block_read(4),
+            ControlReadRequest {
+                request: 0x03,
+                value: 0x0000,
+                index: 0x3c04,
+                length: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn level_responses_invert_the_device_mapping() {
+        // Endpoints of the write mapping decode back to themselves.
+        for level in [0.0, 0.25, 0.5, 1.0] {
+            let encoded = NormalizedLevel::new(level).unwrap();
+            let bytes = encoded.audient_value().to_le_bytes();
+            let decoded = decode_level_response(&bytes).unwrap();
+            assert!(
+                (decoded - level).abs() < 0.001,
+                "level {level} decoded as {decoded}"
+            );
+        }
+        // Raw silence and full scale land exactly on the endpoints.
+        assert_eq!(decode_level_response(&[0x00, 0x80]), Ok(0.0));
+        assert_eq!(decode_level_response(&[0xff, 0xff]), Ok(1.0));
+    }
+
+    #[test]
+    fn short_level_responses_are_rejected_not_zero_filled() {
+        for bytes in [&[][..], &[0x00][..], &[0x00, 0x80, 0x00][..]] {
+            assert_eq!(
+                decode_level_response(bytes),
+                Err(DecodeError::ShortResponse {
+                    expected: 2,
+                    actual: bytes.len(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_responses_decode_any_nonzero_byte_as_on() {
+        assert_eq!(decode_toggle_response(&[0x00]), Ok(false));
+        assert_eq!(decode_toggle_response(&[0x01]), Ok(true));
+        assert_eq!(decode_toggle_response(&[0xff]), Ok(true));
+        assert_eq!(
+            decode_toggle_response(&[]),
+            Err(DecodeError::ShortResponse {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            decode_toggle_response(&[0x01, 0x00]),
+            Err(DecodeError::ShortResponse {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn digital_mode_responses_accept_only_known_modes() {
+        assert_eq!(
+            decode_digital_output_mode_response(&[0, 0, 0, 0]),
+            Ok(DigitalOutputMode::Adat)
+        );
+        assert_eq!(
+            decode_digital_output_mode_response(&[1, 0, 0, 0]),
+            Ok(DigitalOutputMode::Spdif)
+        );
+        assert!(matches!(
+            decode_digital_output_mode_response(&[2, 0, 0, 0]),
+            Err(DecodeError::InvalidValue(_))
+        ));
+        assert_eq!(
+            decode_digital_output_mode_response(&[0, 0, 0]),
+            Err(DecodeError::ShortResponse {
+                expected: 4,
+                actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn meter_blocks_yield_the_first_byte_of_each_node() {
+        let mut block = [0_u8; 32];
+        let (pairs, _) = block.as_chunks_mut::<2>();
+        let mut level = 0_u8;
+        for pair in pairs {
+            pair[0] = level;
+            pair[1] = 0xaa;
+            level = level.wrapping_add(0x10);
+        }
+        assert_eq!(decode_meter_block(&block, 3), Ok(vec![0x00, 0x10, 0x20]));
+        assert_eq!(decode_meter_block(&block, 0), Ok(vec![]));
+        assert_eq!(
+            decode_meter_block(&block, MAX_METER_INPUTS).unwrap().len(),
+            16
+        );
+    }
+
+    #[test]
+    fn short_or_oversized_meter_reads_are_rejected() {
+        let block = [0_u8; 32];
+        assert_eq!(
+            decode_meter_block(&block[..31], 10),
+            Err(DecodeError::ShortResponse {
+                expected: 32,
+                actual: 31,
+            })
+        );
+        assert_eq!(
+            decode_meter_block(&[], 10),
+            Err(DecodeError::ShortResponse {
+                expected: 32,
+                actual: 0,
+            })
+        );
+        assert!(matches!(
+            decode_meter_block(&block, MAX_METER_INPUTS + 1),
+            Err(DecodeError::InvalidValue(_))
+        ));
     }
 }

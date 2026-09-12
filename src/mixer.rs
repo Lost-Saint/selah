@@ -9,7 +9,6 @@
 use crate::device::{DetectedDevice, DeviceModel};
 use crate::monitor::{ToggleControl, VolumeControl};
 use crate::routing::{AdatChannel, adat_input_mixer_index};
-
 /// Live send state for one input channel strip.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStrip {
@@ -55,9 +54,30 @@ pub fn mixer_available(device: &DetectedDevice) -> bool {
     device.control_interface.is_some() && device.model.product_id == 0x0008
 }
 
+/// Whether per-input VU meters can be offered for this attachment.
+///
+/// Meters come from the same mixer entity as the strips (`GET_MEM` block
+/// read, `BiD` `get_meters`), so they follow the same gate — and the same
+/// channel numbering. Models without strips get no meters: a meter for a
+/// channel Selah cannot name would be a guess, not feedback.
+#[must_use]
+pub fn meter_feedback_available(device: &DetectedDevice) -> bool {
+    mixer_available(device)
+}
+
+/// How many meter levels one block read yields for a model: the running
+/// input count, capped at the sixteen nodes one block can describe.
+#[must_use]
+pub fn meter_channel_count(model: &DeviceModel) -> u8 {
+    mixer_channel_count(model).min(crate::device::MAX_METER_INPUTS)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{channel_name, mixer_available, mixer_channel_count};
+    use super::{
+        channel_name, meter_channel_count, meter_feedback_available, mixer_available,
+        mixer_channel_count,
+    };
     use crate::device::{ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation};
 
     #[test]
@@ -90,6 +110,22 @@ mod tests {
         assert!(mixer_available(&device_with(0x0008, true)));
         assert!(!mixer_available(&device_with(0x0008, false)));
         assert!(!mixer_available(&device_with(0x000d, true)));
+    }
+
+    #[test]
+    fn meters_follow_the_mixer_gate_with_capped_channel_counts() {
+        assert!(meter_feedback_available(&device_with(0x0008, true)));
+        assert!(!meter_feedback_available(&device_with(0x0008, false)));
+        assert!(!meter_feedback_available(&device_with(0x000d, true)));
+        // iD14 MKII strips fit one block; large models never exceed it.
+        assert_eq!(
+            meter_channel_count(crate::device::supported_device(0x0008).unwrap()),
+            10
+        );
+        assert_eq!(
+            meter_channel_count(crate::device::supported_device(0x0012).unwrap()),
+            crate::device::MAX_METER_INPUTS
+        );
     }
 
     fn device_with(product_id: u16, has_control: bool) -> DetectedDevice {

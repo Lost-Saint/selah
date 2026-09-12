@@ -32,6 +32,26 @@ fn sends_harmless_headphone_volume_request() {
         .block_on(check_headphone_volume());
 }
 
+#[test]
+#[ignore = "reads a physical device; set SELAH_HARDWARE_PRODUCT_ID and run explicitly"]
+fn reads_monitor_volume_harmlessly() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Tokio runtime should start")
+        .block_on(check_monitor_volume_read());
+}
+
+#[test]
+#[ignore = "reads a physical device; set SELAH_HARDWARE_PRODUCT_ID and run explicitly"]
+fn probes_meter_block_harmlessly() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Tokio runtime should start")
+        .block_on(check_meter_block_probe());
+}
+
 async fn check_session() {
     let selected = select_single_device().await;
 
@@ -78,6 +98,53 @@ async fn check_headphone_volume() {
         .set_headphone_level(level)
         .await
         .expect("headphone volume requests should succeed");
+    session
+        .close()
+        .await
+        .expect("safe session should close cleanly");
+}
+
+/// Reads the monitor volume node back without writing anything.
+///
+/// `GET_CUR` never changes device state, so this is safe on any setup.
+/// It passes when the device answers two bytes that decode to `0.0..=1.0`;
+/// a stall or short block fails the read and leaves the device untouched.
+async fn check_monitor_volume_read() {
+    let selected = select_single_device().await;
+
+    let mut session = DeviceSession::open(&selected)
+        .await
+        .expect("safe session should open");
+    let level = session
+        .speaker_level()
+        .await
+        .expect("monitor volume should read back");
+    assert!(
+        (0.0..=1.0).contains(&level),
+        "decoded monitor level {level} is outside 0.0..=1.0"
+    );
+    session
+        .close()
+        .await
+        .expect("safe session should close cleanly");
+}
+
+/// Probes the `GET_MEM` meter block without writing anything.
+///
+/// Like the volume read this never changes device state. It passes when
+/// the device answers a whole 32-byte block; models without a meter source
+/// fail the probe, which is the honest unavailable signal.
+async fn check_meter_block_probe() {
+    let selected = select_single_device().await;
+
+    let mut session = DeviceSession::open(&selected)
+        .await
+        .expect("safe session should open");
+    let levels = session
+        .meter_levels(selah::device::MAX_METER_INPUTS)
+        .await
+        .expect("meter block should read back");
+    assert_eq!(levels.len(), selah::device::MAX_METER_INPUTS as usize);
     session
         .close()
         .await

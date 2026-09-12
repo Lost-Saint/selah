@@ -7,6 +7,8 @@
 //! distinctions stay inside the transport.
 
 use super::{DetectedDevice, DeviceSession, MonitorToggle, NormalizedLevel, SessionError};
+use crate::mixer::{meter_channel_count, meter_feedback_available};
+use crate::monitor::{speaker_feedback_available, toggle_feedback_available};
 use crate::routing::{DigitalOutputMode, Route, digital_output_mode_available, validate_route};
 
 /// Sends one bounded speaker volume request and always closes the session.
@@ -125,6 +127,98 @@ pub async fn send_channel_polarity(
     close_after_send(session, send).await
 }
 
+/// Monitor state read back from the device. Every field is optional: `None`
+/// means the control is unsupported on this model or the device did not
+/// answer, and callers must keep showing unknown — never zero, never the
+/// last locally requested value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MonitorSnapshot {
+    pub speaker_level: Option<f32>,
+    pub toggles: Vec<(MonitorToggle, bool)>,
+    pub digital_output_mode: Option<DigitalOutputMode>,
+}
+
+/// One bounded feedback poll: monitor state plus meter levels.
+///
+/// `meters` holds one level byte per mixer input, in running-input order,
+/// or is `None` when meters are unsupported or the block did not arrive
+/// whole. `monitor` is `None` when the caller did not ask for it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FeedbackSnapshot {
+    pub monitor: Option<MonitorSnapshot>,
+    pub meters: Option<Vec<u8>>,
+}
+
+/// Reads supported device state and meter levels on one short-lived session.
+///
+/// Only controls with reference evidence for truthful reads are queried
+/// (monitor volume, monitor toggles, optical-output mode, meter block).
+/// Mixer levels, polarity, routing, and headphone level have no trusted
+/// readback, so they are never read and stay unknown-or-sent in the UI.
+/// Each field that fails to answer becomes `None` rather than failing the
+/// whole snapshot; only opening or closing the session fails the poll.
+///
+/// # Errors
+///
+/// Returns a message with a recovery hint when opening or closing fails.
+pub async fn read_feedback(
+    device: DetectedDevice,
+    read_monitor: bool,
+) -> Result<FeedbackSnapshot, String> {
+    let mut session = open_session(&device).await?;
+    let snapshot = FeedbackSnapshot {
+        monitor: if read_monitor {
+            Some(read_monitor_snapshot(&mut session, &device).await)
+        } else {
+            None
+        },
+        meters: read_meter_levels(&mut session, &device).await,
+    };
+    close_after_read(session, snapshot).await
+}
+
+async fn read_monitor_snapshot(
+    session: &mut DeviceSession,
+    device: &DetectedDevice,
+) -> MonitorSnapshot {
+    let speaker_level = if speaker_feedback_available(device) {
+        session.speaker_level().await.ok()
+    } else {
+        None
+    };
+    let mut toggles = Vec::new();
+    if toggle_feedback_available(device) {
+        for toggle in MonitorToggle::ALL {
+            if let Ok(on) = session.monitor_toggle_state(toggle).await {
+                toggles.push((toggle, on));
+            }
+        }
+    }
+    let digital_output_mode = if digital_output_mode_available(device) {
+        session.digital_output_mode().await.ok()
+    } else {
+        None
+    };
+    MonitorSnapshot {
+        speaker_level,
+        toggles,
+        digital_output_mode,
+    }
+}
+
+async fn read_meter_levels(
+    session: &mut DeviceSession,
+    device: &DetectedDevice,
+) -> Option<Vec<u8>> {
+    if !meter_feedback_available(device) {
+        return None;
+    }
+    session
+        .meter_levels(meter_channel_count(device.model))
+        .await
+        .ok()
+}
+
 /// Rejects a channel index outside the model's microphone plus digital
 /// inputs before any USB I/O happens.
 fn validated_channel(device: &DetectedDevice, channel: u8) -> Result<u8, String> {
@@ -168,6 +262,16 @@ async fn close_after_send(
             }
             Err(format!("{error} — {}", error.recovery_hint()))
         }
+    }
+}
+
+async fn close_after_read(
+    session: DeviceSession,
+    snapshot: FeedbackSnapshot,
+) -> Result<FeedbackSnapshot, String> {
+    match session.close().await {
+        Ok(()) => Ok(snapshot),
+        Err(error) => Err(format!("{error} — {}", error.recovery_hint())),
     }
 }
 

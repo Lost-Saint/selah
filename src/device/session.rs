@@ -2,17 +2,24 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
-use nusb::transfer::{ControlOut, ControlType, Recipient};
+use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient};
 
 use super::protocol::{
-    ControlRequest, MonitorToggle, channel_polarity, channel_volume, digital_output_mode,
-    headphone_volume, monitor_toggle, output_route, speaker_volume,
+    ControlReadRequest, ControlRequest, DecodeError, MonitorToggle, channel_polarity,
+    channel_volume, decode_digital_output_mode_response, decode_level_response, decode_meter_block,
+    decode_toggle_response, digital_output_mode, digital_output_mode_read, headphone_volume,
+    meter_block_read, monitor_toggle, monitor_toggle_read, output_route, speaker_volume,
+    speaker_volume_read,
 };
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 use crate::routing::{DigitalOutputMode, InvalidRoute, Route};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xff;
+
+// Reads use the BiD reference's 100 ms timeout: long enough for a truthful
+// answer, short enough that a stalled entity cannot wedge a refresh tick.
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A non-audio USB interface suitable for Audient mixer control requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +206,74 @@ impl DeviceSession {
         self.owner.send(&request).await
     }
 
+    /// Reads the monitor volume node back from the device.
+    ///
+    /// This is the `GET_CUR` counterpart of [`DeviceSession::set_speaker_level`],
+    /// after `BiD` `get_monitor_volume`. Calls require mutable access so reads
+    /// stay serialized with other device I/O on this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails or the device
+    /// answers bytes that do not decode to a level.
+    pub async fn speaker_level(&mut self) -> Result<f32, SessionError> {
+        let request = speaker_volume_read(self.control_interface().number);
+        let bytes = self.owner.read(&request).await?;
+        decode_level_response(&bytes).map_err(SessionError::UnexpectedResponse)
+    }
+
+    /// Reads one monitor toggle back from the device.
+    ///
+    /// This is the `GET_CUR` counterpart of [`DeviceSession::set_monitor_toggle`],
+    /// after `BiD` `get_bool_state`. Only toggles with a readback-capable
+    /// mapping should be queried; there is intentionally no read for mixer,
+    /// routing, polarity, or headphone state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails or the device
+    /// answers anything but a one-byte bool.
+    pub async fn monitor_toggle_state(
+        &mut self,
+        toggle: MonitorToggle,
+    ) -> Result<bool, SessionError> {
+        let request = monitor_toggle_read(toggle, self.control_interface().number);
+        let bytes = self.owner.read(&request).await?;
+        decode_toggle_response(&bytes).map_err(SessionError::UnexpectedResponse)
+    }
+
+    /// Reads the iD24 optical-output mode back from the device.
+    ///
+    /// This is the `GET_CUR` counterpart of
+    /// [`DeviceSession::set_digital_output_mode`], after `BiD`
+    /// `get_optical_mode`. Values outside ADAT/S/PDIF are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails or the device
+    /// answers bytes that do not decode to a known mode.
+    pub async fn digital_output_mode(&mut self) -> Result<DigitalOutputMode, SessionError> {
+        let request = digital_output_mode_read(self.control_interface().number);
+        let bytes = self.owner.read(&request).await?;
+        decode_digital_output_mode_response(&bytes).map_err(SessionError::UnexpectedResponse)
+    }
+
+    /// Reads the whole input-node meter block back from the device.
+    ///
+    /// This is the `GET_MEM` block read from `BiD` `get_meters`: one transfer
+    /// for every input node. `inputs` is the model's running input count,
+    /// capped at the block size; only that many level bytes are returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails or the device
+    /// answers anything but a whole block.
+    pub async fn meter_levels(&mut self, inputs: u8) -> Result<Vec<u8>, SessionError> {
+        let request = meter_block_read(self.control_interface().number);
+        let bytes = self.owner.read(&request).await?;
+        decode_meter_block(&bytes, inputs).map_err(SessionError::UnexpectedResponse)
+    }
+
     /// Releases the control interface and closes the session.
     ///
     /// # Errors
@@ -248,6 +323,10 @@ where
         self.transport.send(&self.handle, request).await
     }
 
+    async fn read(&mut self, request: &ControlReadRequest) -> Result<Vec<u8>, T::Error> {
+        self.transport.read(&self.handle, request).await
+    }
+
     async fn close(self) -> Result<(), T::Error> {
         self.transport.release(self.handle, self.control).await
     }
@@ -278,6 +357,12 @@ trait SessionTransport: Send + Sync {
         handle: &Self::Handle,
         request: &ControlRequest,
     ) -> Result<(), Self::Error>;
+
+    async fn read(
+        &self,
+        handle: &Self::Handle,
+        request: &ControlReadRequest,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 struct UsbTransport;
@@ -365,6 +450,27 @@ impl SessionTransport for UsbTransport {
             .await
             .map_err(SessionError::Transfer)
     }
+
+    async fn read(
+        &self,
+        interface: &Self::Handle,
+        request: &ControlReadRequest,
+    ) -> Result<Vec<u8>, Self::Error> {
+        interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: request.request,
+                    value: request.value,
+                    index: request.index,
+                    length: request.length,
+                },
+                READ_TIMEOUT,
+            )
+            .await
+            .map_err(SessionError::Transfer)
+    }
 }
 
 fn matches_selection(
@@ -383,12 +489,26 @@ fn matches_selection(
 pub enum SessionError {
     InvalidRoute(InvalidRoute),
     Enumerate(nusb::Error),
-    NotFound { product_id: u16 },
-    NoSafeControlInterface { product_id: u16 },
+    NotFound {
+        product_id: u16,
+    },
+    NoSafeControlInterface {
+        product_id: u16,
+    },
     Open(nusb::Error),
-    Claim { interface: u8, source: nusb::Error },
+    Claim {
+        interface: u8,
+        source: nusb::Error,
+    },
     Transfer(nusb::transfer::TransferError),
-    Release { interface: u8, source: nusb::Error },
+    Release {
+        interface: u8,
+        source: nusb::Error,
+    },
+    /// The device answered a read, but the bytes do not decode to the
+    /// requested value. Callers must treat the value as unknown, never as
+    /// zero or as the last locally requested value.
+    UnexpectedResponse(DecodeError),
 }
 
 /// Stable error categories callers can use without depending on `nusb` details.
@@ -415,7 +535,9 @@ impl SessionError {
             Self::Transfer(nusb::transfer::TransferError::Disconnected) => {
                 SessionErrorKind::Disconnected
             }
-            Self::InvalidRoute(_) | Self::Transfer(_) => SessionErrorKind::Other,
+            Self::InvalidRoute(_) | Self::Transfer(_) | Self::UnexpectedResponse(_) => {
+                SessionErrorKind::Other
+            }
         }
     }
 
@@ -470,6 +592,12 @@ impl Display for SessionError {
                 )
             }
             Self::Transfer(source) => write!(formatter, "Audient control request failed: {source}"),
+            Self::UnexpectedResponse(source) => {
+                write!(
+                    formatter,
+                    "Audient device answered an unreadable value: {source}"
+                )
+            }
             Self::Release { interface, source } => {
                 write!(
                     formatter,
@@ -489,6 +617,7 @@ impl Error for SessionError {
             | Self::Release { source, .. } => Some(source),
             Self::Transfer(source) => Some(source),
             Self::InvalidRoute(source) => Some(source),
+            Self::UnexpectedResponse(source) => Some(source),
             Self::NotFound { .. } | Self::NoSafeControlInterface { .. } => None,
         }
     }
@@ -531,7 +660,7 @@ mod tests {
         SessionError, SessionErrorKind, SessionOwner, SessionTransport, classify_nusb_error,
         select_control_interface,
     };
-    use crate::device::protocol::ControlRequest;
+    use crate::device::protocol::{ControlReadRequest, ControlRequest};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockError {
@@ -546,6 +675,7 @@ mod tests {
         releases: usize,
         handles_dropped: usize,
         sends: usize,
+        reads: usize,
         /// Handles acquired but neither released nor dropped. Any test
         /// ending with this above zero has left a session claimed.
         live_handles: usize,
@@ -556,6 +686,8 @@ mod tests {
         acquire_error: bool,
         release_error: bool,
         send_error: bool,
+        /// Bytes handed back for every read; empty means reads fail.
+        read_bytes: Vec<u8>,
         /// When set, only the first this many acquisitions succeed and the
         /// rest fail, simulating a disconnect partway through a cycle run.
         fail_acquire_after: Option<usize>,
@@ -627,6 +759,20 @@ mod tests {
                 Err(MockError::Send)
             } else {
                 Ok(())
+            }
+        }
+
+        async fn read(
+            &self,
+            _handle: &Self::Handle,
+            _request: &ControlReadRequest,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.state.lock().unwrap().reads += 1;
+
+            if self.read_bytes.is_empty() {
+                Err(MockError::Send)
+            } else {
+                Ok(self.read_bytes.clone())
             }
         }
     }
@@ -732,6 +878,48 @@ mod tests {
     }
 
     #[test]
+    fn read_returns_scripted_bytes_without_releasing() {
+        use crate::device::protocol::speaker_volume_read;
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport_with_read_bytes(&state, vec![0x00, 0xc0]),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        let request = speaker_volume_read(4);
+        assert_eq!(block_on(owner.read(&request)), Ok(vec![0x00, 0xc0]));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.reads, 1);
+        assert_eq!(state.releases, 0);
+    }
+
+    #[test]
+    fn read_failure_is_returned_without_releasing() {
+        use crate::device::protocol::speaker_volume_read;
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let mut owner = block_on(SessionOwner::open(
+            mock_transport(&state, false, false),
+            &selected_device(),
+        ))
+        .unwrap();
+
+        // No scripted bytes: the mock answers reads with an error, like a
+        // stalled entity. The session stays closeable either way.
+        let request = speaker_volume_read(4);
+        assert_eq!(block_on(owner.read(&request)), Err(MockError::Send));
+        assert_eq!(block_on(owner.close()), Ok(()));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.reads, 1);
+        assert_eq!(state.releases, 1);
+        assert_eq!(state.live_handles, 0);
+    }
+
+    #[test]
     fn rapid_connect_disconnect_cycles_leave_nothing_outstanding() {
         let state = Arc::new(Mutex::new(MockState::default()));
 
@@ -826,6 +1014,8 @@ mod tests {
     fn session_failures_map_to_actionable_kinds_and_hints() {
         use nusb::transfer::TransferError;
 
+        use crate::device::DecodeError;
+
         // Constructible without hardware: these carry no nusb::Error payload.
         let cases = [
             (
@@ -850,6 +1040,16 @@ mod tests {
             ),
             (
                 SessionError::Transfer(TransferError::Stall),
+                SessionErrorKind::Other,
+                "Reconnect",
+            ),
+            // A short block is not a disconnect: the value is unknown and
+            // the user retries the read, not the cable.
+            (
+                SessionError::UnexpectedResponse(DecodeError::ShortResponse {
+                    expected: 32,
+                    actual: 0,
+                }),
                 SessionErrorKind::Other,
                 "Reconnect",
             ),
@@ -886,6 +1086,7 @@ mod tests {
             acquire_error,
             release_error,
             send_error: false,
+            read_bytes: Vec::new(),
             fail_acquire_after: None,
         }
     }
@@ -899,6 +1100,21 @@ mod tests {
             acquire_error: false,
             release_error: false,
             send_error,
+            read_bytes: Vec::new(),
+            fail_acquire_after: None,
+        }
+    }
+
+    fn mock_transport_with_read_bytes(
+        state: &Arc<Mutex<MockState>>,
+        read_bytes: Vec<u8>,
+    ) -> MockTransport {
+        MockTransport {
+            state: Arc::clone(state),
+            acquire_error: false,
+            release_error: false,
+            send_error: false,
+            read_bytes,
             fail_acquire_after: None,
         }
     }
@@ -912,6 +1128,7 @@ mod tests {
             acquire_error: false,
             release_error: false,
             send_error: false,
+            read_bytes: Vec::new(),
             fail_acquire_after: Some(succeed_first),
         }
     }

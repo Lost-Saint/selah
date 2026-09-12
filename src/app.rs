@@ -1,15 +1,20 @@
-use iced::widget::{button, column, container, row, scrollable, slider, space, text};
+use std::time::Duration;
+
+use iced::widget::{button, column, container, progress_bar, row, scrollable, slider, space, text};
 use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 
 use crate::device::{
-    DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, MonitorToggle,
-    UnknownAudientDevice, discover, send_channel_level, send_channel_polarity,
-    send_digital_output_mode, send_headphone_level, send_monitor_toggle, send_output_route,
-    send_speaker_level, watch_events,
+    DetectedDevice, DeviceLocation, DeviceWatchEvent, DiscoveryError, DiscoveryReport,
+    FeedbackSnapshot, MonitorToggle, UnknownAudientDevice, discover, read_feedback,
+    send_channel_level, send_channel_polarity, send_digital_output_mode, send_headphone_level,
+    send_monitor_toggle, send_output_route, send_speaker_level, watch_events,
 };
-use crate::mixer::{ChannelStrip, channel_name, mixer_available, mixer_channel_count};
+use crate::mixer::{
+    ChannelStrip, channel_name, meter_feedback_available, mixer_available, mixer_channel_count,
+};
 use crate::monitor::{
     ToggleControl, VolumeControl, monitor_controls_available, monitor_toggles_available,
+    speaker_feedback_available, toggle_feedback_available,
 };
 use crate::routing::{
     DigitalOutputMode, OutputRouteControl, Route, RouteStatus, RoutingDestination,
@@ -18,6 +23,11 @@ use crate::routing::{
 
 mod route_state;
 use route_state::fresh_routes;
+
+/// Meter polls run at 10 Hz: the slowest rate that still reads as motion.
+/// Monitor state rides the same timer at ~1 Hz (see [`monitor_due`]).
+const METER_CADENCE_MS: u64 = 100;
+const MONITOR_CADENCE_MS: u64 = 1_000;
 
 struct App {
     status: DeviceStatus,
@@ -30,6 +40,19 @@ struct App {
     digital_output_mode: ToggleControl,
     toggles: [ToggleControl; 5],
     channels: Vec<ChannelStrip>,
+    /// One level byte per mixer input while meters are supported, `None`
+    /// per input while the level is unknown. Unknown is never shown as zero.
+    meters: Vec<Option<u8>>,
+    /// Whether a background feedback poll currently owns a device session.
+    /// Ticks arriving while this is set are skipped, so polls can never
+    /// overlap or queue behind each other.
+    feedback_in_flight: bool,
+    /// Counts feedback ticks to fold the ~1 Hz monitor refresh into the
+    /// faster meter cadence on one session per tick.
+    feedback_tick: u64,
+    /// The last feedback failure, shown once until a poll succeeds or the
+    /// device set changes. Last confirmed values stay visible underneath.
+    feedback_notice: Option<String>,
 }
 
 /// Outcome of one background speaker-volume send, paired with the level it
@@ -89,6 +112,15 @@ struct DigitalOutputModeOutcome {
     result: Result<(), String>,
 }
 
+/// Outcome of one background feedback poll, paired with the attachment it
+/// read so completions from a replaced device are ignored.
+#[derive(Clone, Debug)]
+struct FeedbackOutcome {
+    location: DeviceLocation,
+    read_monitor: bool,
+    result: Result<FeedbackSnapshot, String>,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
@@ -109,6 +141,8 @@ enum Message {
     ChannelLevelFinished(ChannelLevelOutcome),
     ChannelPolarityChanged { channel: u8, flipped: bool },
     ChannelPolarityFinished(ChannelPolarityOutcome),
+    FeedbackTick,
+    FeedbackFinished(FeedbackOutcome),
 }
 
 enum DeviceStatus {
@@ -149,6 +183,10 @@ impl App {
                 digital_output_mode: ToggleControl::default(),
                 toggles: Default::default(),
                 channels: Vec::new(),
+                meters: Vec::new(),
+                feedback_in_flight: false,
+                feedback_tick: 0,
+                feedback_notice: None,
             },
             Task::none(),
         )
@@ -165,19 +203,8 @@ fn toggle_index(toggle: MonitorToggle) -> usize {
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
-        Message::DeviceWatch(DeviceWatchEvent::Started) => {
-            tracing::info!("Watching for USB device changes");
-            app.watch_status = WatchStatus::Active;
-            request_scan(app)
-        }
-        Message::Refresh | Message::DeviceWatch(DeviceWatchEvent::DevicesChanged) => {
-            request_scan(app)
-        }
-        Message::DeviceWatch(DeviceWatchEvent::Failed(error)) => {
-            tracing::warn!(%error, "Automatic USB device detection is unavailable");
-            app.watch_status = WatchStatus::Failed;
-            request_scan(app)
-        }
+        Message::DeviceWatch(event) => device_watch_event(app, event),
+        Message::Refresh => request_scan(app),
         Message::DiscoveryFinished(Ok(report)) if !report.supported.is_empty() => {
             tracing::info!(
                 supported = report.supported.len(),
@@ -191,7 +218,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.routes = fresh_routes(&app.status);
             app.digital_output_mode = ToggleControl::default();
             app.channels = fresh_channels(&app.status);
-            finish_scan(app)
+            // A (re)connected device starts unknown: old local values are
+            // never restored as confirmed, and the refresh below adopts
+            // whatever the hardware actually reports.
+            app.meters = fresh_meters(&app.status);
+            app.feedback_notice = None;
+            app.feedback_in_flight = false;
+            app.feedback_tick = 0;
+            let scan = finish_scan(app);
+            Task::batch([scan, refresh_task(app, true)])
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
             tracing::warn!(
@@ -205,6 +240,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
+            app.meters = Vec::new();
+            app.feedback_notice = None;
+            app.feedback_in_flight = false;
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(_)) => {
@@ -216,6 +254,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
+            app.meters = Vec::new();
+            app.feedback_notice = None;
+            app.feedback_in_flight = false;
             finish_scan(app)
         }
         Message::DiscoveryFinished(Err(error)) => {
@@ -227,6 +268,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
+            app.meters = Vec::new();
+            app.feedback_notice = None;
+            app.feedback_in_flight = false;
             finish_scan(app)
         }
         Message::SpeakerVolumeChanged(level) => request_speaker_volume(app, level),
@@ -248,6 +292,28 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             request_channel_polarity(app, channel, flipped)
         }
         Message::ChannelPolarityFinished(outcome) => finish_channel_polarity(app, outcome),
+        Message::FeedbackTick => request_feedback(app),
+        Message::FeedbackFinished(outcome) => finish_feedback(app, outcome),
+    }
+}
+
+/// Handles the operating-system USB monitor without polling.
+///
+/// Connection changes trigger a fresh descriptor scan; a failed monitor
+/// falls back to the manual scan button.
+fn device_watch_event(app: &mut App, event: DeviceWatchEvent) -> Task<Message> {
+    match event {
+        DeviceWatchEvent::Started => {
+            tracing::info!("Watching for USB device changes");
+            app.watch_status = WatchStatus::Active;
+            request_scan(app)
+        }
+        DeviceWatchEvent::DevicesChanged => request_scan(app),
+        DeviceWatchEvent::Failed(error) => {
+            tracing::warn!(%error, "Automatic USB device detection is unavailable");
+            app.watch_status = WatchStatus::Failed;
+            request_scan(app)
+        }
     }
 }
 
@@ -261,6 +327,166 @@ fn fresh_channels(status: &DeviceStatus) -> Vec<ChannelStrip> {
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+/// Builds one unknown meter slot per mixer input. Meters start unknown and
+/// only show values a whole device block actually delivered.
+fn fresh_meters(status: &DeviceStatus) -> Vec<Option<u8>> {
+    match status {
+        DeviceStatus::Ready(report) => {
+            let count = mixer_channel_count(report.supported[0].model) as usize;
+            std::iter::repeat_with(|| None).take(count).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// How often the device may be polled, or `None` when no feedback is
+/// supported. Meters need ~10 Hz to read as motion; monitor state follows
+/// at ~1 Hz. Anything without a readable control or a meter source gets no
+/// timer at all, so Selah stays quiet instead of polling blindly.
+fn feedback_cadence(app: &App) -> Option<Duration> {
+    feedback_cadence_ms(app).map(Duration::from_millis)
+}
+
+fn feedback_cadence_ms(app: &App) -> Option<u64> {
+    let device = selected_device(app)?;
+    device.control_interface?;
+    if meter_feedback_available(&device) {
+        Some(METER_CADENCE_MS)
+    } else if speaker_feedback_available(&device)
+        || toggle_feedback_available(&device)
+        || digital_output_mode_available(&device)
+    {
+        Some(MONITOR_CADENCE_MS)
+    } else {
+        None
+    }
+}
+
+/// Whether this tick also refreshes monitor state. The monitor snapshot
+/// rides every ~1 s on top of the meter cadence, on the same session.
+fn monitor_due(tick: u64, cadence_ms: u64) -> bool {
+    tick.is_multiple_of((MONITOR_CADENCE_MS / cadence_ms.max(1)).max(1))
+}
+
+/// Starts one bounded feedback poll unless one already owns a session.
+///
+/// Ticks arriving while a poll is in flight are dropped, never queued: at
+/// most one session exists per tick, each tick holds it briefly, and the
+/// subscription disappears entirely when no supported device is present.
+fn request_feedback(app: &mut App) -> Task<Message> {
+    let Some(cadence_ms) = feedback_cadence_ms(app) else {
+        return Task::none();
+    };
+    if app.feedback_in_flight {
+        return Task::none();
+    }
+    app.feedback_tick = app.feedback_tick.wrapping_add(1);
+    refresh_task(app, monitor_due(app.feedback_tick, cadence_ms))
+}
+
+/// One immediate hardware refresh on (re)connect, outside the tick cadence.
+fn refresh_task(app: &mut App, read_monitor: bool) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+    if feedback_cadence(app).is_none() {
+        return Task::none();
+    }
+    app.feedback_in_flight = true;
+    let location = device.location.clone();
+    Task::perform(
+        async move {
+            FeedbackOutcome {
+                location,
+                read_monitor,
+                result: read_feedback(device, read_monitor).await,
+            }
+        },
+        Message::FeedbackFinished,
+    )
+}
+
+/// Adopts a feedback poll result: hardware values win over local state.
+///
+/// Monitor fields the device answered become confirmed and move their
+/// controls; controls with a send in flight keep their pending value until
+/// the send completes. Meter levels replace the previous block only when
+/// their length still matches the current strips, so a completion from a
+/// replaced device cannot resize or shift live meters. A failed poll blanks
+/// the meters — a frozen meter presented as live would be a lie — but keeps
+/// the last confirmed monitor values underneath a retry notice.
+fn finish_feedback(app: &mut App, outcome: FeedbackOutcome) -> Task<Message> {
+    let current = selected_device(app).map(|device| device.location.clone());
+    if current.as_ref() != Some(&outcome.location) {
+        // A completion from a replaced attachment: it must neither adopt
+        // state nor clear a newer poll's in-flight flag. With no device at
+        // all the flag cannot belong to a running task, so reset it.
+        if current.is_none() {
+            app.feedback_in_flight = false;
+        }
+        return Task::none();
+    }
+    app.feedback_in_flight = false;
+    match outcome.result {
+        Ok(snapshot) => {
+            app.feedback_notice = None;
+            if outcome.read_monitor
+                && let Some(monitor) = snapshot.monitor
+            {
+                adopt_monitor_snapshot(app, &monitor);
+            }
+            adopt_meter_levels(app, snapshot.meters);
+        }
+        Err(error) => {
+            if app.feedback_notice.is_none() {
+                tracing::warn!(%error, "Device feedback is unavailable");
+            } else {
+                tracing::debug!(%error, "Device feedback poll failed");
+            }
+            app.meters.fill(None);
+            app.feedback_notice = Some(error);
+        }
+    }
+    Task::none()
+}
+
+fn adopt_monitor_snapshot(app: &mut App, monitor: &crate::device::MonitorSnapshot) {
+    if let Some(level) = monitor.speaker_level
+        && app.speaker.apply_confirmed(level)
+    {
+        tracing::debug!(level, "Speaker level confirmed by hardware");
+    }
+    for (toggle, on) in &monitor.toggles {
+        if app.toggles[toggle_index(*toggle)].apply_confirmed(*on) {
+            tracing::debug!(?toggle, on, "Monitor toggle confirmed by hardware");
+        }
+    }
+    if let Some(mode) = monitor.digital_output_mode
+        && app.digital_output_mode.apply_confirmed(mode.as_toggle())
+    {
+        tracing::debug!(
+            mode = mode.label(),
+            "Digital output mode confirmed by hardware"
+        );
+    }
+}
+
+fn adopt_meter_levels(app: &mut App, meters: Option<Vec<u8>>) {
+    match meters {
+        Some(levels) if levels.len() == app.meters.len() => {
+            for (slot, level) in app.meters.iter_mut().zip(levels) {
+                *slot = Some(level);
+            }
+        }
+        Some(_) => {
+            tracing::debug!("Ignoring meter block from a replaced device");
+        }
+        None => {
+            app.meters.fill(None);
+        }
     }
 }
 
@@ -682,8 +908,17 @@ fn discovery_task() -> Task<Message> {
     Task::perform(discover(), Message::DiscoveryFinished)
 }
 
-fn subscription(_app: &App) -> Subscription<Message> {
-    Subscription::run(watch_events).map(Message::DeviceWatch)
+fn subscription(app: &App) -> Subscription<Message> {
+    let watch = Subscription::run(watch_events).map(Message::DeviceWatch);
+    match feedback_cadence(app) {
+        // The timer exists only while a supported device is present, so
+        // metering suspends on disconnect instead of polling blindly.
+        Some(cadence) => Subscription::batch([
+            watch,
+            iced::time::every(cadence).map(|_| Message::FeedbackTick),
+        ]),
+        None => watch,
+    }
 }
 
 fn theme(_app: &App) -> Theme {
@@ -703,13 +938,9 @@ fn view(app: &App) -> Element<'_, Message> {
     let header = row![
         text("Selah").size(24),
         space().width(Length::Fill),
-        container(
-            text("Write-only · no readback")
-                .size(13)
-                .style(text::secondary)
-        )
-        .padding([6, 10])
-        .style(container::secondary),
+        container(text(feedback_summary(app)).size(13).style(text::secondary))
+            .padding([6, 10])
+            .style(container::secondary),
     ]
     .align_y(Alignment::Center);
 
@@ -722,15 +953,7 @@ fn view(app: &App) -> Element<'_, Message> {
                 .style(text::secondary),
         ]
         .spacing(8),
-        container(status_view(
-            &app.status,
-            &app.speaker,
-            &app.headphone,
-            &app.routes,
-            &app.digital_output_mode,
-            &app.toggles,
-            &app.channels
-        ))
+        container(status_view(app))
             .width(Fill)
             .padding(28)
             .style(container::rounded_box),
@@ -751,6 +974,27 @@ fn view(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// One-line honesty summary for the header: what this attachment actually
+/// reports back, so write-only controls are never mistaken for live state.
+fn feedback_summary(app: &App) -> &'static str {
+    let Some(device) = selected_device(app) else {
+        return "Write-only · no readback";
+    };
+    if device.control_interface.is_none() {
+        return "Write-only · no readback";
+    }
+    if meter_feedback_available(&device) {
+        "Hardware feedback · monitor + meters"
+    } else if speaker_feedback_available(&device)
+        || toggle_feedback_available(&device)
+        || digital_output_mode_available(&device)
+    {
+        "Hardware feedback · monitor readback"
+    } else {
+        "Write-only · no readback"
+    }
+}
+
 fn watch_status(app: &App) -> &'static str {
     match app.watch_status {
         WatchStatus::Starting => "Starting automatic USB detection",
@@ -759,16 +1003,8 @@ fn watch_status(app: &App) -> &'static str {
     }
 }
 
-fn status_view<'a>(
-    status: &'a DeviceStatus,
-    speaker: &'a VolumeControl,
-    headphone: &'a VolumeControl,
-    routes: &'a [OutputRouteControl],
-    digital_output_mode: &'a ToggleControl,
-    toggles: &'a [ToggleControl; 5],
-    channels: &'a [ChannelStrip],
-) -> Element<'a, Message> {
-    match status {
+fn status_view(app: &App) -> Element<'_, Message> {
+    match &app.status {
         DeviceStatus::Scanning => column![
             status_label("Scanning", container::secondary),
             text("Looking for Audient interfaces…").size(24),
@@ -787,15 +1023,7 @@ fn status_view<'a>(
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => supported_view(
-            report,
-            speaker,
-            headphone,
-            routes,
-            digital_output_mode,
-            toggles,
-            channels,
-        ),
+        DeviceStatus::Ready(report) => supported_view(app, report),
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -808,15 +1036,7 @@ fn status_view<'a>(
     }
 }
 
-fn supported_view<'a>(
-    report: &'a DiscoveryReport,
-    speaker: &'a VolumeControl,
-    headphone: &'a VolumeControl,
-    routes: &'a [OutputRouteControl],
-    digital_output_mode: &'a ToggleControl,
-    toggles: &'a [ToggleControl; 5],
-    channels: &'a [ChannelStrip],
-) -> Element<'a, Message> {
+fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, Message> {
     let device = &report.supported[0];
     let model = device.model;
     let extra = additional_devices(report);
@@ -837,6 +1057,20 @@ fn supported_view<'a>(
             .size(15)
             .style(text::secondary),
         text(session_readiness).size(14),
+    ]
+    .spacing(14);
+
+    if let Some(notice) = app.feedback_notice.as_deref() {
+        content = content.push(
+            text(format!(
+                "Hardware read failed: {notice} Scan again to retry."
+            ))
+            .size(13)
+            .style(text::warning),
+        );
+    }
+
+    content = content.push(
         column![
             detail_row("Microphone inputs", model.mic_inputs),
             detail_row("Digital inputs", model.digital_inputs),
@@ -845,26 +1079,25 @@ fn supported_view<'a>(
             detail_row("Inserts", model.inserts),
         ]
         .spacing(9),
-    ]
-    .spacing(14);
+    );
 
     // Capability-driven: the volume controls only exist when a safe control
     // interface is available. Without one there is nothing to send through.
     if monitor_controls_available(device) {
         content = content.push(volume_slider(
             "Speaker volume",
-            speaker,
+            &app.speaker,
             Message::SpeakerVolumeChanged,
         ));
         content = content.push(volume_slider(
             "Headphone volume",
-            headphone,
+            &app.headphone,
             Message::HeadphoneVolumeChanged,
         ));
     }
 
     if routing_available(device) {
-        content = content.push(routing_view(model, routes));
+        content = content.push(routing_view(model, &app.routes));
     } else if model.routing.is_some() {
         content = content.push(
             column![
@@ -888,7 +1121,7 @@ fn supported_view<'a>(
     }
 
     if digital_output_mode_available(device) {
-        content = content.push(digital_output_mode_view(digital_output_mode));
+        content = content.push(digital_output_mode_view(&app.digital_output_mode));
     }
 
     if model.inserts > 0 {
@@ -902,14 +1135,14 @@ fn supported_view<'a>(
     // Monitor toggles share the same gate: the `0x36` toggle table is
     // verified against the iD14 MKII layout so far.
     if monitor_toggles_available(device) {
-        content = content.push(monitor_toggles_view(toggles));
+        content = content.push(monitor_toggles_view(&app.toggles));
     }
 
     // Input mixer strips, model-driven: microphones then digital inputs.
     // Channel mute, solo, and stereo linking have no known mapping, so no
     // control for them is shown.
     if mixer_available(device) {
-        content = content.push(mixer_view(device.model, channels));
+        content = content.push(mixer_view(device.model, &app.channels, &app.meters));
     }
 
     if let Some(extra) = extra {
@@ -919,11 +1152,11 @@ fn supported_view<'a>(
     content.into()
 }
 
-/// One monitor volume slider without implying confirmed device state.
+/// One monitor volume slider.
 ///
-/// Selah cannot read the current level back, so the slider position is the
-/// last requested level and the status line reports what was sent — never
-/// what the device is confirmed to hold.
+/// The speaker slider adopts hardware-confirmed levels; the headphone
+/// slider has no trusted readback, so its position stays the last requested
+/// level and its status line reports what was sent — never confirmed state.
 fn volume_slider<'a>(
     title: &'static str,
     control: &'a VolumeControl,
@@ -996,6 +1229,10 @@ fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
     use crate::monitor::ToggleStatus;
 
     let sending = matches!(control.status(), ToggleStatus::Sending { .. });
+    let confirmed = match control.status() {
+        ToggleStatus::Confirmed { on } => Some(on),
+        _ => None,
+    };
     let known_request = !matches!(control.status(), ToggleStatus::Unknown);
     let requested_adat = known_request && control.position();
     let requested_spdif = known_request && !control.position();
@@ -1004,6 +1241,10 @@ fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
         ToggleStatus::Sending { sending } => {
             format!("Sending {}…", if sending { "ADAT" } else { "S/PDIF" })
         }
+        ToggleStatus::Confirmed { on } => format!(
+            "Hardware reports {} — follows the device.",
+            if on { "ADAT" } else { "S/PDIF" }
+        ),
         ToggleStatus::Sent { on } => format!(
             "Last sent {} — accepted, not read back from the device.",
             if on { "ADAT" } else { "S/PDIF" }
@@ -1018,7 +1259,9 @@ fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
             .size(13)
             .style(text::secondary),
         row![
-            button(text(if requested_adat {
+            button(text(if confirmed == Some(true) {
+                "ADAT · hardware"
+            } else if requested_adat {
                 "ADAT · requested"
             } else {
                 "ADAT"
@@ -1026,7 +1269,9 @@ fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
             .on_press_maybe(
                 (!sending).then_some(Message::DigitalOutputModeSelected(DigitalOutputMode::Adat,))
             ),
-            button(text(if requested_spdif {
+            button(text(if confirmed == Some(false) {
+                "S/PDIF · hardware"
+            } else if requested_spdif {
                 "S/PDIF · requested"
             } else {
                 "S/PDIF"
@@ -1042,10 +1287,10 @@ fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
     .into()
 }
 
-/// Monitor toggles without implying confirmed device state.
+/// Monitor toggles: confirmed values follow the hardware.
 ///
-/// Each button shows the last requested on/off value; the status line
-/// reports what was sent — never what the device is confirmed to hold.
+/// Each button shows the last requested on/off value until readback
+/// confirms what the device holds; the status line names which one it is.
 /// Buttons are real Iced buttons, so they stay keyboard-focusable.
 fn monitor_toggles_view(toggles: &[ToggleControl; 5]) -> Element<'_, Message> {
     let mut section = column![text("Monitor").size(16)].spacing(8);
@@ -1082,7 +1327,9 @@ fn monitor_toggle_button(toggle: MonitorToggle, control: &ToggleControl) -> Elem
 }
 
 /// Input mixer section: one strip per input, scrolling horizontally on
-/// high-channel-count models instead of hiding channels.
+/// high-channel-count models instead of hiding channels. Each strip carries
+/// a bounded VU meter fed by the device's meter block; meters with no data
+/// show an unknown placeholder, never a fake zero.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "strip count comes from a u8 model count, so enumerate indexes always fit"
@@ -1090,10 +1337,16 @@ fn monitor_toggle_button(toggle: MonitorToggle, control: &ToggleControl) -> Elem
 fn mixer_view<'a>(
     model: &'a crate::device::DeviceModel,
     channels: &'a [ChannelStrip],
+    meters: &'a [Option<u8>],
 ) -> Element<'a, Message> {
     let mut strips = row![].spacing(12);
     for (index, strip) in channels.iter().enumerate() {
-        strips = strips.push(channel_strip_view(model, index as u8, strip));
+        strips = strips.push(channel_strip_view(
+            model,
+            index as u8,
+            strip,
+            meters.get(index).copied().flatten(),
+        ));
     }
     column![
         text("Input mix").size(16),
@@ -1106,15 +1359,17 @@ fn mixer_view<'a>(
     .into()
 }
 
-/// One channel strip without implying confirmed device state.
+/// One channel strip: last-requested fader and polarity, plus live meter.
 ///
-/// The fader position and polarity value are the last requested values;
-/// the status lines report what was sent — never what the device is
-/// confirmed to hold.
+/// The fader position and polarity value are the last requested values
+/// until monitor-style readback exists for the matrix — the matrix does not
+/// answer reads, so their status lines report what was sent. The meter is
+/// the opposite: purely device-reported, unknown until a block arrives.
 fn channel_strip_view<'a>(
     model: &'a crate::device::DeviceModel,
     channel: u8,
     strip: &'a ChannelStrip,
+    meter: Option<u8>,
 ) -> Element<'a, Message> {
     use crate::monitor::ToggleStatus;
 
@@ -1133,6 +1388,7 @@ fn channel_strip_view<'a>(
         text(strip.level.status_text())
             .size(12)
             .style(text::secondary),
+        meter_view(meter),
         button(text(polarity_label)).on_press_maybe((!polarity_sending).then_some(
             Message::ChannelPolarityChanged {
                 channel,
@@ -1146,6 +1402,22 @@ fn channel_strip_view<'a>(
     .spacing(6)
     .width(Length::Fixed(150.0))
     .into()
+}
+
+/// One bounded VU meter: a fixed-width bar for a device-reported level, or
+/// an unknown placeholder that is visually distinct from silence.
+fn meter_view(meter: Option<u8>) -> Element<'static, Message> {
+    match meter {
+        Some(level) => {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a 0..=255 level byte converts to f32 exactly"
+            )]
+            let percent = f32::from(level) / 255.0 * 100.0;
+            progress_bar(0.0..=100.0, percent).into()
+        }
+        None => text("meter —").size(11).style(text::secondary).into(),
+    }
 }
 
 fn unknown_view(device: &UnknownAudientDevice) -> Element<'_, Message> {
@@ -1200,12 +1472,13 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
 mod tests {
     use super::{
         App, ChannelLevelOutcome, ChannelPolarityOutcome, DeviceStatus, DigitalOutputModeOutcome,
-        Message, MonitorToggleOutcome, RoutingOutcome, SpeakerVolumeOutcome, finish_scan,
-        fresh_routes, request_scan, route_control, toggle_index, update,
+        FeedbackOutcome, METER_CADENCE_MS, MONITOR_CADENCE_MS, Message, MonitorToggleOutcome,
+        RoutingOutcome, SpeakerVolumeOutcome, feedback_cadence_ms, finish_scan, fresh_meters,
+        fresh_routes, monitor_due, request_scan, route_control, toggle_index, update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
-        MonitorToggle,
+        FeedbackSnapshot, MonitorSnapshot, MonitorToggle,
     };
     use crate::monitor::{ToggleStatus, VolumeStatus};
     use crate::routing::{
@@ -1586,6 +1859,246 @@ mod tests {
         std::iter::repeat_with(crate::mixer::ChannelStrip::default)
             .take(10)
             .collect()
+    }
+
+    #[test]
+    fn feedback_cadence_needs_a_supported_device_with_a_control_interface() {
+        let (mut app, _startup) = App::new();
+        assert_eq!(feedback_cadence_ms(&app), None);
+
+        app.status = DeviceStatus::Empty;
+        assert_eq!(feedback_cadence_ms(&app), None);
+
+        // Ready but no safe control interface: nothing may be polled.
+        let mut report = report_with_control();
+        report.supported[0].control_interface = None;
+        app.status = DeviceStatus::Ready(report);
+        assert_eq!(feedback_cadence_ms(&app), None);
+    }
+
+    #[test]
+    fn feedback_cadence_prefers_meters_then_monitor_readback() {
+        let (mut app, _startup) = App::new();
+
+        // iD14 MKII: strips and meters share one gate.
+        app.status = DeviceStatus::Ready(report_with_control());
+        assert_eq!(feedback_cadence_ms(&app), Some(METER_CADENCE_MS));
+
+        // iD4: monitor volumes read back, but no mixer means no meters.
+        let mut report = report_with_control();
+        report.supported[0].model = crate::device::supported_device(0x0003).unwrap();
+        app.status = DeviceStatus::Ready(report);
+        assert_eq!(feedback_cadence_ms(&app), Some(MONITOR_CADENCE_MS));
+    }
+
+    #[test]
+    fn monitor_refresh_folds_into_the_meter_cadence() {
+        assert!(monitor_due(10, METER_CADENCE_MS));
+        assert!(monitor_due(20, METER_CADENCE_MS));
+        assert!(!monitor_due(5, METER_CADENCE_MS));
+        assert!(!monitor_due(11, METER_CADENCE_MS));
+        // On the slow cadence every tick carries the monitor snapshot.
+        assert!(monitor_due(1, MONITOR_CADENCE_MS));
+        assert!(monitor_due(7, MONITOR_CADENCE_MS));
+    }
+
+    #[test]
+    fn feedback_tick_is_dropped_while_a_poll_owns_the_session() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.feedback_in_flight = true;
+
+        let _dropped = update(&mut app, Message::FeedbackTick);
+        assert!(app.feedback_in_flight);
+        assert_eq!(app.feedback_tick, 0);
+    }
+
+    #[test]
+    fn connect_refresh_adopts_hardware_state_as_confirmed() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+        app.meters = fresh_meters(&app.status);
+        assert_eq!(app.speaker.status(), VolumeStatus::Unknown);
+
+        let _done = update(
+            &mut app,
+            Message::FeedbackFinished(feedback_ok(
+                MonitorSnapshot {
+                    speaker_level: Some(0.7),
+                    toggles: vec![(MonitorToggle::Dim, true)],
+                    digital_output_mode: None,
+                },
+                Some(vec![0x40; 10]),
+            )),
+        );
+
+        // Hardware wins: the slider moves to the device value and the
+        // status names it confirmed, not sent.
+        assert_level_eq(app.speaker.position(), 0.7);
+        assert_eq!(app.speaker.status(), VolumeStatus::Confirmed { level: 0.7 });
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Confirmed { on: true }
+        );
+        assert_eq!(app.meters, vec![Some(0x40); 10]);
+        assert!(app.feedback_notice.is_none());
+        assert!(!app.feedback_in_flight);
+    }
+
+    #[test]
+    fn pending_send_is_not_overwritten_by_readback() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(&mut app, Message::SpeakerVolumeChanged(0.2));
+        let _refresh = update(
+            &mut app,
+            Message::FeedbackFinished(feedback_ok(
+                MonitorSnapshot {
+                    speaker_level: Some(0.9),
+                    toggles: Vec::new(),
+                    digital_output_mode: None,
+                },
+                None,
+            )),
+        );
+
+        // The local operation wins transiently; the hardware value is not
+        // adopted until the send completes and the next poll confirms it.
+        assert_level_eq(app.speaker.position(), 0.2);
+        assert_eq!(
+            app.speaker.status(),
+            VolumeStatus::Sending {
+                sending: 0.2,
+                queued: None,
+            }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::SpeakerVolumeFinished(SpeakerVolumeOutcome {
+                level: 0.2,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(app.speaker.status(), VolumeStatus::Sent { level: 0.2 });
+    }
+
+    #[test]
+    fn failed_poll_blanks_meters_but_keeps_confirmed_monitor() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+        app.meters = fresh_meters(&app.status);
+
+        let _confirmed = update(
+            &mut app,
+            Message::FeedbackFinished(feedback_ok(
+                MonitorSnapshot {
+                    speaker_level: Some(0.5),
+                    toggles: Vec::new(),
+                    digital_output_mode: None,
+                },
+                Some(vec![0x20; 10]),
+            )),
+        );
+        assert_eq!(app.speaker.status(), VolumeStatus::Confirmed { level: 0.5 });
+
+        // A frozen meter presented as live would be a lie: meters go back
+        // to unknown while the last confirmed monitor value stands.
+        let _failed = update(
+            &mut app,
+            Message::FeedbackFinished(FeedbackOutcome {
+                location: report_location(),
+                read_monitor: false,
+                result: Err("stalled".to_owned()),
+            }),
+        );
+        assert!(app.meters.iter().all(Option::is_none));
+        assert_eq!(app.speaker.status(), VolumeStatus::Confirmed { level: 0.5 });
+        assert_eq!(app.feedback_notice.as_deref(), Some("stalled"));
+    }
+
+    #[test]
+    fn stale_feedback_from_a_replaced_device_is_ignored() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.feedback_in_flight = true;
+
+        let _stale = update(
+            &mut app,
+            Message::FeedbackFinished(FeedbackOutcome {
+                location: DeviceLocation {
+                    bus: "9".to_owned(),
+                    address: 9,
+                },
+                read_monitor: true,
+                result: Ok(FeedbackSnapshot {
+                    monitor: Some(MonitorSnapshot {
+                        speaker_level: Some(0.1),
+                        toggles: Vec::new(),
+                        digital_output_mode: None,
+                    }),
+                    meters: None,
+                }),
+            }),
+        );
+
+        // Neither adopted nor cleared: the newer poll still owns the flag.
+        assert_eq!(app.speaker.status(), VolumeStatus::Unknown);
+        assert!(app.feedback_in_flight);
+    }
+
+    #[test]
+    fn reconnect_resets_confirmed_state_and_meters_to_unknown() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+        app.meters = fresh_meters(&app.status);
+
+        let _confirmed = update(
+            &mut app,
+            Message::FeedbackFinished(feedback_ok(
+                MonitorSnapshot {
+                    speaker_level: Some(0.6),
+                    toggles: Vec::new(),
+                    digital_output_mode: None,
+                },
+                Some(vec![0x10; 10]),
+            )),
+        );
+        assert_eq!(app.speaker.status(), VolumeStatus::Confirmed { level: 0.6 });
+
+        // Disconnect drops everything: old values are never restored as
+        // confirmed before readback succeeds again.
+        let _gone = update(
+            &mut app,
+            Message::DiscoveryFinished(Ok(DiscoveryReport::default())),
+        );
+        assert!(matches!(app.status, DeviceStatus::Empty));
+        assert_eq!(app.speaker.status(), VolumeStatus::Unknown);
+        assert!(app.meters.is_empty());
+        assert!(app.feedback_notice.is_none());
+        assert!(!app.feedback_in_flight);
+    }
+
+    fn feedback_ok(monitor: MonitorSnapshot, meters: Option<Vec<u8>>) -> FeedbackOutcome {
+        FeedbackOutcome {
+            location: report_location(),
+            read_monitor: true,
+            result: Ok(FeedbackSnapshot {
+                monitor: Some(monitor),
+                meters,
+            }),
+        }
+    }
+
+    fn report_location() -> DeviceLocation {
+        DeviceLocation {
+            bus: "1".to_owned(),
+            address: 2,
+        }
     }
 
     fn headphone_route(source: RoutingSource) -> Route {

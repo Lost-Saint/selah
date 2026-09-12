@@ -48,7 +48,7 @@ Selah has the application foundation with the Milestone 2 monitor slice and the 
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app sends monitor, mixer, and capability-gated routing controls through background tasks that claim and release the control interface per operation, with pending, sent, failed, and unknown states and no state readback. Routing names physical output destinations and mix sources, supports per-output reset, and never derives a write from channel count alone. The input mixer remains one strip per microphone then digital input, with explicit ADAT numbering after onboard inputs. Channel mute, solo, stereo linking, and insert/send-return have no known USB mapping, so no working control is shown. Existing control transfers were verified on an iD14 MKII without disturbing Linux audio, but Selah's expanded routing writes still await the hardware checks recorded under Milestone 4. A safe claim-and-release cycle, repeated session/volume cycles, a busy-interface forced-error probe, GUI close, and unplug/replug recovery have all left Linux audio working. Hardware permission-denied handling remains unit-tested only because exercising it requires system ACL or udev changes.
+The app sends monitor, mixer, and capability-gated routing controls through background tasks that claim and release the control interface per operation, with pending, sent, confirmed, failed, and unknown states. Monitor volume, monitor toggles, and the iD24 optical-output mode read back through bounded `GET_CUR` polls and adopt hardware state (front-panel moves and reconnects appear instead of being overwritten); per-input VU meters read a probed `GET_MEM` block at 10 Hz with the monitor snapshot folded in every ~1 s, on one session per tick and no timer when no supported device is present. Routing, mixer levels, polarity, and headphone level stay write-only because their reads alias or stall, and show last-sent or unknown — never confirmed. Routing names physical output destinations and mix sources, supports per-output reset, and never derives a write from channel count alone. The input mixer remains one strip per microphone then digital input, with explicit ADAT numbering after onboard inputs. Channel mute, solo, stereo linking, and insert/send-return have no known USB mapping, so no working control is shown. Existing control transfers were verified on an iD14 MKII without disturbing Linux audio, but Selah's expanded routing writes still await the hardware checks recorded under Milestone 4. The new readback paths have passed transfer-level on the same model (monitor-volume roundtrip, whole meter block, and a warning-free GUI feedback session); meter level accuracy against a known signal and audible confirmation remain open. A safe claim-and-release cycle, repeated session/volume cycles, a busy-interface forced-error probe, GUI close, and unplug/replug recovery have all left Linux audio working. Hardware permission-denied handling remains unit-tested only because exercising it requires system ACL or udev changes.
 
 ## Milestone 1 — Safe device session
 
@@ -109,13 +109,13 @@ MixiD does not yet provide complete state readback, so Selah must not present a 
 
 **Outcome:** Selah reflects what the hardware is doing instead of acting as a write-only remote.
 
-- Read back mixer and monitor state where protocol support is known.
-- Reconcile external hardware changes without jumping or overwriting them.
-- Add bounded, event-driven VU meters after the protocol is verified; upstream research is tracked in [MixiD issue #7](https://github.com/TheOnlyJoey/MixiD/issues/7).
-- Suspend metering when hidden, disconnected, or unchanged to avoid continuous GPU and USB load.
-- Show unavailable feedback as unknown rather than zero.
+- Read back mixer and monitor state where protocol support is known. ✅ in code (monitor volume, monitor toggles, and optical-output mode via BiD-evidenced `GET_CUR`; mixer levels, polarity, routing, and headphone level are evidenced write-only, so they stay last-sent/unknown rather than faked)
+- Reconcile external hardware changes without jumping or overwriting them. ✅ in code (confirmed state wins; pending sends finish before adoption; reconnect resets to unknown before readback)
+- Add bounded, event-driven VU meters after the protocol is verified; upstream research is tracked in [MixiD issue #7](https://github.com/TheOnlyJoey/MixiD/issues/7). ✅ in code (probed `GET_MEM` block at 10 Hz on one session per tick, capability-gated to models with mixer strips; short blocks rejected, failures blank instead of freezing)
+- Suspend metering when hidden, disconnected, or unchanged to avoid continuous GPU and USB load. ✅ in code (the timer exists only while a readable device is present; mid-poll ticks are dropped; unchanged values stay quiet — with the note that the current single-window app has no meaningful hidden state to suspend on)
+- Show unavailable feedback as unknown rather than zero. ✅ in code (unknown meters render as a placeholder, never a zero bar; unconfirmed levels never default to `0`, `false`, or the last sent value)
 
-**Exit condition:** UI values survive reconnect accurately when the device supports readback, and metering remains responsive without busy polling or continuous repainting.
+**Exit condition:** UI values survive reconnect accurately when the device supports readback, and metering remains responsive without busy polling or continuous repainting. ✅ in code and hardware-independent tests, with transfer-level hardware evidence on an iD14 MKII (monitor roundtrip, meter block, warning-free GUI session). Open: meter level accuracy against a known signal, audible confirmation, and the Milestone 4 Selah-transfer verification above.
 
 ## Milestone 6 — Broad iD verification
 
@@ -157,6 +157,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The current target remains **Milestone 4 hardware verification**. Its capability-driven implementation is code-complete, but the Selah-specific compact and digitally expanded device checks above remain before Milestone 5 begins.
+The current target is **hardware verification for Milestones 4 and 5**: the Selah-specific routing-transfer checks on compact and digitally expanded devices, plus the first readback and meter-block probes (`reads_monitor_volume_harmlessly`, `probes_meter_block_harmlessly`) on a named model with its firmware version recorded.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.
