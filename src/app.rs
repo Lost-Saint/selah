@@ -1,11 +1,13 @@
-use iced::widget::{button, column, container, row, slider, space, text};
+use iced::widget::{button, column, container, row, scrollable, slider, space, text};
 use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 
 use crate::device::{
     DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, MonitorToggle,
-    UnknownAudientDevice, discover, send_headphone_level, send_monitor_toggle,
-    send_phones_to_main_mix, send_speaker_level, watch_events,
+    UnknownAudientDevice, discover, send_channel_level, send_channel_polarity,
+    send_headphone_level, send_monitor_toggle, send_phones_to_main_mix, send_speaker_level,
+    watch_events,
 };
+use crate::mixer::{ChannelStrip, channel_name, mixer_available, mixer_channel_count};
 use crate::monitor::{
     ToggleControl, VolumeControl, monitor_controls_available, monitor_toggles_available,
 };
@@ -20,6 +22,7 @@ struct App {
     headphone: VolumeControl,
     routing: RouteControl,
     toggles: [ToggleControl; 5],
+    channels: Vec<ChannelStrip>,
 }
 
 /// Outcome of one background speaker-volume send, paired with the level it
@@ -47,6 +50,24 @@ struct MonitorToggleOutcome {
     result: Result<(), String>,
 }
 
+/// Outcome of one background channel-level send, paired with the channel
+/// and level it attempted so stale completions can be ignored.
+#[derive(Clone, Debug)]
+struct ChannelLevelOutcome {
+    channel: u8,
+    level: f32,
+    result: Result<(), String>,
+}
+
+/// Outcome of one background channel-polarity send, paired with the channel
+/// and value it attempted so stale completions can be ignored.
+#[derive(Clone, Debug)]
+struct ChannelPolarityOutcome {
+    channel: u8,
+    flipped: bool,
+    result: Result<(), String>,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
@@ -60,6 +81,10 @@ enum Message {
     RoutingFinished(Result<(), String>),
     MonitorToggleChanged { toggle: MonitorToggle, on: bool },
     MonitorToggleFinished(MonitorToggleOutcome),
+    ChannelLevelChanged { channel: u8, level: f32 },
+    ChannelLevelFinished(ChannelLevelOutcome),
+    ChannelPolarityChanged { channel: u8, flipped: bool },
+    ChannelPolarityFinished(ChannelPolarityOutcome),
 }
 
 enum DeviceStatus {
@@ -98,6 +123,7 @@ impl App {
                 headphone: VolumeControl::default(),
                 routing: RouteControl::default(),
                 toggles: Default::default(),
+                channels: Vec::new(),
             },
             Task::none(),
         )
@@ -138,6 +164,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routing = RouteControl::default();
+            app.channels = fresh_channels(&app.status);
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
@@ -150,6 +177,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routing = RouteControl::default();
+            app.channels = Vec::new();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Ok(_)) => {
@@ -159,6 +187,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routing = RouteControl::default();
+            app.channels = Vec::new();
             finish_scan(app)
         }
         Message::DiscoveryFinished(Err(error)) => {
@@ -168,6 +197,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routing = RouteControl::default();
+            app.channels = Vec::new();
             finish_scan(app)
         }
         Message::SpeakerVolumeChanged(level) => request_speaker_volume(app, level),
@@ -178,6 +208,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::RoutingFinished(result) => finish_routing(app, result),
         Message::MonitorToggleChanged { toggle, on } => request_monitor_toggle(app, toggle, on),
         Message::MonitorToggleFinished(outcome) => finish_monitor_toggle(app, outcome),
+        Message::ChannelLevelChanged { channel, level } => {
+            request_channel_level(app, channel, level)
+        }
+        Message::ChannelLevelFinished(outcome) => finish_channel_level(app, outcome),
+        Message::ChannelPolarityChanged { channel, flipped } => {
+            request_channel_polarity(app, channel, flipped)
+        }
+        Message::ChannelPolarityFinished(outcome) => finish_channel_polarity(app, outcome),
+    }
+}
+
+/// Builds a fresh strip per input of the newly discovered model.
+fn fresh_channels(status: &DeviceStatus) -> Vec<ChannelStrip> {
+    match status {
+        DeviceStatus::Ready(report) => {
+            let count = mixer_channel_count(report.supported[0].model) as usize;
+            std::iter::repeat_with(ChannelStrip::default)
+                .take(count)
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -319,6 +370,104 @@ fn finish_monitor_toggle(app: &mut App, outcome: MonitorToggleOutcome) -> Task<M
     Task::none()
 }
 
+/// Looks up the strip for a channel, ignoring completions for strips that
+/// no longer exist after a rescan or model change.
+fn channel_strip(app: &mut App, channel: u8) -> Option<&mut ChannelStrip> {
+    app.channels.get_mut(channel as usize)
+}
+
+/// Starts a background channel-level send, queuing when one is in flight.
+///
+/// The USB work runs in the returned task, away from Iced's UI thread.
+fn request_channel_level(app: &mut App, channel: u8, level: f32) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+    let Some(strip) = channel_strip(app, channel) else {
+        return Task::none();
+    };
+
+    match strip.level.request(level) {
+        Some(send) => channel_level_task(device, channel, send),
+        None => Task::none(),
+    }
+}
+
+/// Records a channel-level result and starts the queued level, if any.
+fn finish_channel_level(app: &mut App, outcome: ChannelLevelOutcome) -> Task<Message> {
+    let ChannelLevelOutcome {
+        channel,
+        level,
+        result,
+    } = outcome;
+    let Some(strip) = channel_strip(app, channel) else {
+        return Task::none();
+    };
+    if !strip.level.is_in_flight(level) {
+        return Task::none();
+    }
+
+    match &result {
+        Ok(()) => tracing::info!(channel, level, "Channel level sent"),
+        Err(error) => tracing::warn!(channel, level, %error, "Channel level send failed"),
+    }
+
+    let next = strip.level.finish(level, result);
+    match next {
+        Some(next_level) => {
+            if let Some(device) = selected_device(app) {
+                channel_level_task(device, channel, next_level)
+            } else if let Some(strip) = channel_strip(app, channel) {
+                strip.level.drop_pending();
+                Task::none()
+            } else {
+                Task::none()
+            }
+        }
+        None => Task::none(),
+    }
+}
+
+/// Starts a channel-polarity send; ignored while one is in flight.
+///
+/// The USB work runs in the returned task, away from Iced's UI thread.
+fn request_channel_polarity(app: &mut App, channel: u8, flipped: bool) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+    let Some(strip) = channel_strip(app, channel) else {
+        return Task::none();
+    };
+
+    match strip.polarity.request(flipped) {
+        Some(send) => channel_polarity_task(device, channel, send),
+        None => Task::none(),
+    }
+}
+
+/// Records a channel-polarity result; stale completions are ignored.
+fn finish_channel_polarity(app: &mut App, outcome: ChannelPolarityOutcome) -> Task<Message> {
+    let ChannelPolarityOutcome {
+        channel,
+        flipped,
+        result,
+    } = outcome;
+    let Some(strip) = channel_strip(app, channel) else {
+        return Task::none();
+    };
+    if !strip.polarity.is_in_flight(flipped) {
+        return Task::none();
+    }
+
+    match &result {
+        Ok(()) => tracing::info!(channel, flipped, "Channel polarity sent"),
+        Err(error) => tracing::warn!(channel, flipped, %error, "Channel polarity send failed"),
+    }
+
+    let _ = strip.polarity.finish(flipped, result);
+    Task::none()
+}
+
 /// The first supported device, matching what `supported_view` displays.
 fn selected_device(app: &App) -> Option<DetectedDevice> {
     match &app.status {
@@ -368,6 +517,32 @@ fn monitor_toggle_task(device: DetectedDevice, toggle: MonitorToggle, on: bool) 
             }
         },
         Message::MonitorToggleFinished,
+    )
+}
+
+fn channel_level_task(device: DetectedDevice, channel: u8, level: f32) -> Task<Message> {
+    Task::perform(
+        async move {
+            ChannelLevelOutcome {
+                channel,
+                level,
+                result: send_channel_level(device, channel, level).await,
+            }
+        },
+        Message::ChannelLevelFinished,
+    )
+}
+
+fn channel_polarity_task(device: DetectedDevice, channel: u8, flipped: bool) -> Task<Message> {
+    Task::perform(
+        async move {
+            ChannelPolarityOutcome {
+                channel,
+                flipped,
+                result: send_channel_polarity(device, channel, flipped).await,
+            }
+        },
+        Message::ChannelPolarityFinished,
     )
 }
 
@@ -441,7 +616,8 @@ fn view(app: &App) -> Element<'_, Message> {
             &app.speaker,
             &app.headphone,
             &app.routing,
-            &app.toggles
+            &app.toggles,
+            &app.channels
         ))
             .width(Fill)
             .padding(28)
@@ -474,6 +650,7 @@ fn status_view<'a>(
     headphone: &'a VolumeControl,
     routing: &'a RouteControl,
     toggles: &'a [ToggleControl; 5],
+    channels: &'a [ChannelStrip],
 ) -> Element<'a, Message> {
     match status {
         DeviceStatus::Scanning => column![
@@ -494,7 +671,9 @@ fn status_view<'a>(
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone, routing, toggles),
+        DeviceStatus::Ready(report) => {
+            supported_view(report, speaker, headphone, routing, toggles, channels)
+        }
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -513,6 +692,7 @@ fn supported_view<'a>(
     headphone: &'a VolumeControl,
     routing: &'a RouteControl,
     toggles: &'a [ToggleControl; 5],
+    channels: &'a [ChannelStrip],
 ) -> Element<'a, Message> {
     let device = &report.supported[0];
     let model = device.model;
@@ -570,6 +750,13 @@ fn supported_view<'a>(
     // verified against the iD14 MKII layout so far.
     if monitor_toggles_available(device) {
         content = content.push(monitor_toggles_view(toggles));
+    }
+
+    // Input mixer strips, model-driven: microphones then digital inputs.
+    // Channel mute, solo, and stereo linking have no known mapping, so no
+    // control for them is shown.
+    if mixer_available(device) {
+        content = content.push(mixer_view(device.model, channels));
     }
 
     if let Some(extra) = extra {
@@ -654,6 +841,73 @@ fn monitor_toggle_button(toggle: MonitorToggle, control: &ToggleControl) -> Elem
     .into()
 }
 
+/// Input mixer section: one strip per input, scrolling horizontally on
+/// high-channel-count models instead of hiding channels.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "strip count comes from a u8 model count, so enumerate indexes always fit"
+)]
+fn mixer_view<'a>(
+    model: &'a crate::device::DeviceModel,
+    channels: &'a [ChannelStrip],
+) -> Element<'a, Message> {
+    let mut strips = row![].spacing(12);
+    for (index, strip) in channels.iter().enumerate() {
+        strips = strips.push(channel_strip_view(model, index as u8, strip));
+    }
+    column![
+        text("Input mix").size(16),
+        text("Mute, solo, and stereo linking have no known mapping and are not shown.")
+            .size(13)
+            .style(text::secondary),
+        scrollable(strips).width(Fill),
+    ]
+    .spacing(8)
+    .into()
+}
+
+/// One channel strip without implying confirmed device state.
+///
+/// The fader position and polarity value are the last requested values;
+/// the status lines report what was sent — never what the device is
+/// confirmed to hold.
+fn channel_strip_view<'a>(
+    model: &'a crate::device::DeviceModel,
+    channel: u8,
+    strip: &'a ChannelStrip,
+) -> Element<'a, Message> {
+    use crate::monitor::ToggleStatus;
+
+    let polarity_sending = matches!(strip.polarity.status(), ToggleStatus::Sending { .. });
+    let polarity_label = if strip.polarity.position() {
+        "Ø ON"
+    } else {
+        "Ø OFF"
+    };
+    column![
+        text(channel_name(model, channel)).size(14),
+        slider(0.0..=1.0, strip.level.position(), move |level| {
+            Message::ChannelLevelChanged { channel, level }
+        })
+        .step(0.01_f32),
+        text(strip.level.status_text())
+            .size(12)
+            .style(text::secondary),
+        button(text(polarity_label)).on_press_maybe((!polarity_sending).then_some(
+            Message::ChannelPolarityChanged {
+                channel,
+                flipped: !strip.polarity.position(),
+            }
+        )),
+        text(strip.polarity.status_text())
+            .size(12)
+            .style(text::secondary),
+    ]
+    .spacing(6)
+    .width(Length::Fixed(150.0))
+    .into()
+}
+
 fn unknown_view(device: &UnknownAudientDevice) -> Element<'_, Message> {
     let name = device
         .reported_name
@@ -705,8 +959,9 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DeviceStatus, HeadphoneVolumeOutcome, Message, MonitorToggleOutcome,
-        SpeakerVolumeOutcome, finish_scan, request_scan, toggle_index, update,
+        App, ChannelLevelOutcome, ChannelPolarityOutcome, DeviceStatus, HeadphoneVolumeOutcome,
+        Message, MonitorToggleOutcome, SpeakerVolumeOutcome, finish_scan, request_scan,
+        toggle_index, update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
@@ -1307,6 +1562,279 @@ mod tests {
             (actual - expected).abs() < f32::EPSILON,
             "expected slider level {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn channels_are_rebuilt_from_the_discovered_model() {
+        use crate::monitor::{ToggleStatus, VolumeStatus};
+
+        let (mut app, _startup) = App::new();
+        assert!(app.channels.is_empty());
+
+        let _ready = update(
+            &mut app,
+            Message::DiscoveryFinished(Ok(report_with_control())),
+        );
+        // iD14 MKII: 2 microphones + 8 digital inputs.
+        assert_eq!(app.channels.len(), 10);
+        assert_eq!(app.channels[0].level.status(), VolumeStatus::Unknown);
+        assert_eq!(app.channels[0].polarity.status(), ToggleStatus::Unknown);
+    }
+
+    #[test]
+    fn channel_level_without_a_device_is_ignored() {
+        let (mut app, _startup) = App::new();
+
+        let _ignored = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 0,
+                level: 0.5,
+            },
+        );
+        assert!(app.channels.is_empty());
+        let _also_ignored = update(
+            &mut app,
+            Message::ChannelPolarityChanged {
+                channel: 0,
+                flipped: true,
+            },
+        );
+        assert!(app.channels.is_empty());
+    }
+
+    #[test]
+    fn channel_level_moves_from_pending_to_applied() {
+        use crate::monitor::VolumeStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _send = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 2,
+                level: 0.6,
+            },
+        );
+        assert_level_eq(app.channels[2].level.position(), 0.6);
+        assert_eq!(
+            app.channels[2].level.status(),
+            VolumeStatus::Sending {
+                sending: 0.6,
+                queued: None,
+            }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::ChannelLevelFinished(ChannelLevelOutcome {
+                channel: 2,
+                level: 0.6,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.channels[2].level.status(),
+            VolumeStatus::Sent { level: 0.6 }
+        );
+    }
+
+    #[test]
+    fn channel_level_failure_keeps_last_sent_and_reports_the_error() {
+        use crate::monitor::VolumeStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _first = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 0,
+                level: 0.5,
+            },
+        );
+        let _applied = update(
+            &mut app,
+            Message::ChannelLevelFinished(ChannelLevelOutcome {
+                channel: 0,
+                level: 0.5,
+                result: Ok(()),
+            }),
+        );
+
+        let _retry = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 0,
+                level: 0.7,
+            },
+        );
+        let _failed = update(
+            &mut app,
+            Message::ChannelLevelFinished(ChannelLevelOutcome {
+                channel: 0,
+                level: 0.7,
+                result: Err("no device".to_owned()),
+            }),
+        );
+        assert_eq!(
+            app.channels[0].level.status(),
+            VolumeStatus::Failed {
+                error: "no device".to_owned(),
+                last_sent: Some(0.5),
+            }
+        );
+    }
+
+    #[test]
+    fn channel_levels_queue_behind_one_send_and_track_independently() {
+        use crate::monitor::VolumeStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _first = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 1,
+                level: 0.4,
+            },
+        );
+        let _second = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 1,
+                level: 0.8,
+            },
+        );
+        assert_eq!(
+            app.channels[1].level.status(),
+            VolumeStatus::Sending {
+                sending: 0.4,
+                queued: Some(0.8),
+            }
+        );
+
+        let _other = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 3,
+                level: 0.2,
+            },
+        );
+        assert_eq!(
+            app.channels[3].level.status(),
+            VolumeStatus::Sending {
+                sending: 0.2,
+                queued: None,
+            }
+        );
+    }
+
+    #[test]
+    fn channel_polarity_moves_from_pending_to_applied() {
+        use crate::monitor::ToggleStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _send = update(
+            &mut app,
+            Message::ChannelPolarityChanged {
+                channel: 1,
+                flipped: true,
+            },
+        );
+        assert_eq!(
+            app.channels[1].polarity.status(),
+            ToggleStatus::Sending { sending: true }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::ChannelPolarityFinished(ChannelPolarityOutcome {
+                channel: 1,
+                flipped: true,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.channels[1].polarity.status(),
+            ToggleStatus::Sent { on: true }
+        );
+    }
+
+    #[test]
+    fn channel_polarity_failure_reports_the_error() {
+        use crate::monitor::ToggleStatus;
+
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _send = update(
+            &mut app,
+            Message::ChannelPolarityChanged {
+                channel: 4,
+                flipped: true,
+            },
+        );
+        let _failed = update(
+            &mut app,
+            Message::ChannelPolarityFinished(ChannelPolarityOutcome {
+                channel: 4,
+                flipped: true,
+                result: Err("busy".to_owned()),
+            }),
+        );
+        assert_eq!(
+            app.channels[4].polarity.status(),
+            ToggleStatus::Failed {
+                error: "busy".to_owned(),
+                last_sent: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_channel_completion_after_a_rescan_is_ignored() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.channels = fresh_ready_channels();
+
+        let _send = update(
+            &mut app,
+            Message::ChannelLevelChanged {
+                channel: 0,
+                level: 0.5,
+            },
+        );
+        let _rescan = update(
+            &mut app,
+            Message::DiscoveryFinished(Ok(DiscoveryReport::default())),
+        );
+        let _stale = update(
+            &mut app,
+            Message::ChannelLevelFinished(ChannelLevelOutcome {
+                channel: 0,
+                level: 0.5,
+                result: Ok(()),
+            }),
+        );
+
+        assert!(matches!(app.status, DeviceStatus::Empty));
+        assert!(app.channels.is_empty());
+    }
+
+    fn fresh_ready_channels() -> Vec<crate::mixer::ChannelStrip> {
+        std::iter::repeat_with(crate::mixer::ChannelStrip::default)
+            .take(10)
+            .collect()
     }
 
     fn report_with_control() -> DiscoveryReport {

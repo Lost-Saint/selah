@@ -2,6 +2,7 @@
 
 mod app;
 pub mod device;
+mod mixer;
 mod monitor;
 mod routing;
 

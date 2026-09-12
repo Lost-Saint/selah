@@ -34,7 +34,7 @@ Features may be marked **reference-derived** until verified on Selah hardware. T
 
 ## Current state
 
-Selah has the application foundation and the first read-only hardware slice:
+Selah has the application foundation with the Milestone 2 monitor slice and the Milestone 3 input mixer:
 
 - Iced application shell and structured logging;
 - catalog entries for the nine iD models known to MixiD;
@@ -48,7 +48,7 @@ Selah has the application foundation and the first read-only hardware slice:
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app can send reference-derived speaker and headphone volume from the UI through serialized background tasks that claim and release the control interface per send, with pending, sent, and failed states and no state readback. Both volume transfers were verified on an iD14 MKII without disturbing its Linux audio interfaces, but the audible change is unconfirmed (headphones-only setup), so both mappings stay reference-derived. A listening test found neither control audible on that setup, likely because the phones are routed to a fixed-level feed rather than Main Mix (see `docs/protocol.md`); the speaker mapping still awaits confirmation on speakers. A safe claim-and-release cycle was also physically verified on the same model, followed by 5 back-to-back session/volume cycles and a busy-interface forced-error probe with recovery, all leaving Linux audio working. The maintainer additionally verified GUI app-close while connected and physical unplug/replug with recovery. The one unverified leg is hardware permission-denied handling, which needs ACL/udev manipulation this environment cannot do without root; that path fails before any handle is acquired and its kind mapping is unit-tested.
+The app sends the Milestone 2 monitor controls from the UI through serialized background tasks that claim and release the control interface per send, with pending, sent, and failed states and no state readback: speaker and headphone volume, a one-way phones-to-Main-Mix action, and DIM / ALT / TB / MONO / MUTE toggles, all gated to the iD14 MKII. It also shows a model-driven input mixer: one strip per microphone then digital input with a level fader and a polarity control, scrolling horizontally on high-channel-count models. Channel mute, solo, and stereo linking have no known USB mapping, so no control for them is shown. Control transfers were verified on an iD14 MKII without disturbing its Linux audio interfaces, but audible confirmation is unconfirmed (headphones-only setup), so all mappings stay reference-derived. A listening test found the volumes inaudible on that setup, likely because the phones are routed to a fixed-level feed rather than Main Mix (see `docs/protocol.md`); the routing action, toggles, and mixer strips await the same listening confirmation. A safe claim-and-release cycle was also physically verified on the same model, followed by 5 back-to-back session/volume cycles and a busy-interface forced-error probe with recovery, all leaving Linux audio working. The maintainer additionally verified GUI app-close while connected and physical unplug/replug with recovery. The unverified legs are audible listening confirmation and hardware permission-denied handling, which needs ACL/udev manipulation this environment cannot do without root; that path fails before any handle is acquired and its kind mapping is unit-tested.
 
 ## Milestone 1 — Safe device session
 
@@ -68,29 +68,29 @@ The app can send reference-derived speaker and headphone volume from the UI thro
 
 **Outcome:** one verified model can perform the daily monitor operations already available in MixiD.
 
-- Main speaker volume.
-- Headphone volume.
-- Dim, mute, mono, alternate-speaker, and talkback controls where supported.
-- Honest pending, applied, failed, and unknown states for each control.
-- Capability-driven UI that hides controls a model does not have.
-- Keyboard-accessible controls and sensible fine adjustment.
+- Main speaker volume. ✅
+- Headphone volume. ✅
+- Dim, mute, mono, alternate-speaker, and talkback controls where supported. ✅ (iD14 MKII gate; per-model differences unverified)
+- Honest pending, applied, failed, and unknown states for each control. ✅
+- Capability-driven UI that hides controls a model does not have. ✅
+- Keyboard-accessible controls and sensible fine adjustment. ✅ (toggles are focusable buttons; sliders step 0.01)
 
 MixiD does not yet provide complete state readback, so Selah must not present a locally remembered value as confirmed device state.
 
-**Exit condition:** every displayed monitor control works repeatedly on the first target model, failures are visible and recoverable, and restarting Selah never invents a confirmed value.
+**Exit condition:** every displayed monitor control works repeatedly on the first target model, failures are visible and recoverable, and restarting Selah never invents a confirmed value. ✅ (code-complete with transfer tests; audible listening confirmation is the documented exception above)
 
 ## Milestone 3 — Input mixer
 
 **Outcome:** users can build and adjust an input mix across the connected model's analog and digital inputs.
 
-- Model-driven channel strips for microphone and digital inputs.
-- Channel level and polarity controls.
-- Stereo linking, tracked upstream in [MixiD issue #22](https://github.com/TheOnlyJoey/MixiD/issues/22).
-- Channel mute and solo with explicit restore semantics, informed by [MixiD issue #4](https://github.com/TheOnlyJoey/MixiD/issues/4).
-- Clear naming and grouping for large ADAT channel counts.
-- Horizontal navigation that remains responsive on high-channel-count models.
+- Model-driven channel strips for microphone and digital inputs. ✅ (counts from the catalog; iD14 MKII gate)
+- Channel level and polarity controls. ✅
+- Stereo linking, tracked upstream in [MixiD issue #22](https://github.com/TheOnlyJoey/MixiD/issues/22). ➖ (no known USB mapping in MixiD, BiD, or Monix; no control shown)
+- Channel mute and solo with explicit restore semantics, informed by [MixiD issue #4](https://github.com/TheOnlyJoey/MixiD/issues/4). ➖ (no known USB mapping; no control shown)
+- Clear naming and grouping for large ADAT channel counts. ✅ (Mic N / Digi N running index)
+- Horizontal navigation that remains responsive on high-channel-count models. ✅ (scrollable strip row; no polling or repaint loops)
 
-**Exit condition:** the mixer scales from iD4-class devices through an expanded interface without incorrect indexes, hidden channels, or stale local state.
+**Exit condition:** the mixer scales from iD4-class devices through an expanded interface without incorrect indexes, hidden channels, or stale local state. ✅ (code-complete with boundary tests; audible listening confirmation is the documented exception above)
 
 ## Milestone 4 — Routing and extended outputs
 
@@ -157,6 +157,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The current target is **Milestone 2: Essential monitoring**, starting with main speaker volume on the iD14 MKII as the initial reference device. The volume mapping stays reference-derived until its audible change is confirmed on speakers. The architecture must remain capability-driven and avoid baking in that model's channel layout.
+The current target is **Milestone 4: Routing and extended outputs**, building a clear source/destination model on the session and honest-state patterns. All control mappings stay reference-derived until audible changes are confirmed on hardware. The architecture must remain capability-driven and avoid baking in one model's channel layout.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.

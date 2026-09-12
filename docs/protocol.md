@@ -62,6 +62,18 @@ MixiD `set_bool_state` (driver.h) flips one monitor bool with `wValue = masterVa
 
 Treat these mappings as reference-derived until each toggle is confirmed audibly on hardware. They change the monitor path; run them only when that is safe for the connected setup.
 
+### Reference-derived input mixer matrix
+
+`MixiD` `set_channel_volume` (driver.h) writes one input's Main-send pair as two cells on entity `0x3c`: `wValue = 0x0100 + channel * 6` (Main L) and `+ 1` (Main R), with the shared two-byte level payload. Selah sends both cells in order on one session, stopping on a first-transfer failure so the pair cannot mismatch silently. Input polarity follows `MixiD` `set_phase_state`: a one-byte bool with `wValue = 0x0d01 + channel` on entity `0x0b`.
+
+`channel` is the running input index across microphone then digital inputs. This deliberately differs from `MixiD`'s UI (main.cpp), whose digital loop reuses its own loop counter and aliases digital channels onto microphone mappings; Selah numbers every input by its position in the full input sequence. Strip counts come from the catalog (`mic_inputs + digital_inputs`).
+
+Three findings from the [BiD fork](https://github.com/baakhoff/BiD) shape this design. The level scale is dB in a u16 (`0x0000` is 0 dB, `0x8000` is mute), not a fraction: low fader values are silence, so audibility tests need high levels — a `0.1` test level sits near −115 dB and proves nothing by ear. The Main-send pair is the input's stereo image (the L/R ratio is the pan), so writing one level to both, as `MixiD` does, sums the input to the centre. And the matrix, routing, and phase entities do not read back, so the faders show the last requested value, never confirmed device state.
+
+Channel mute, solo, and stereo linking have no known USB mapping in `MixiD`, BiD, or [Monix](https://github.com/sKuhLight/monix): Selah sends nothing for them and shows no control that pretends otherwise. DAW-return rows exist on the matrix but have no strips yet; Selah leaves rows it does not own untouched rather than silencing the user's computer audio on connect.
+
+Treat these mappings as reference-derived until each strip is confirmed audibly on hardware. They change the monitor path; run them only when that is safe for the connected setup.
+
 ## Hardware verification
 
 | Date | Model | USB identity | Verification | Result |

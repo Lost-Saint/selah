@@ -2,9 +2,9 @@
 
 Selah is an early-stage Linux control panel for Audient iD audio interfaces, written in Rust with [Iced](https://iced.rs/) and [`nusb`](https://crates.io/crates/nusb). It builds on the device and protocol research in [MixiD](https://github.com/TheOnlyJoey/MixiD).
 
-The current application performs USB descriptor discovery, automatically refreshes when USB devices connect or disconnect, identifies known iD models, and reports unknown Audient interfaces. It can also send reference-derived speaker and headphone volume from the UI through serialized background tasks that briefly claim a safe control interface per send, then release it. There is no state readback: each slider shows the last requested level, not confirmed device state.
+The current application performs USB descriptor discovery, automatically refreshes when USB devices connect or disconnect, identifies known iD models, and reports unknown Audient interfaces. On the iD14 MKII it can also send the Milestone 2 monitor controls from the UI through serialized background tasks that briefly claim a safe control interface per send, then release it: speaker and headphone volume sliders, a one-way phones-to-Main-Mix action, and a DIM / ALT / TB / MONO / MUTE toggle strip. It also shows a model-driven input mixer with one strip per microphone then digital input, each with a level fader and a polarity control. There is no state readback: sliders and buttons show the last requested value, not confirmed device state. Channel mute, solo, and stereo linking have no known USB mapping, so no control for them is shown.
 
-Transfer acceptance for both volumes was verified on an iD14 MKII without disturbing Linux audio, but the audible change is unconfirmed (headphones-only setup; the phones appear routed to a fixed-level feed, not Main Mix). See [`docs/protocol.md`](docs/protocol.md). Treat both mappings as reference-derived.
+Transfer acceptance for these controls was verified on an iD14 MKII without disturbing Linux audio, but the audible change is unconfirmed (headphones-only setup). See [`docs/protocol.md`](docs/protocol.md). Treat all mappings as reference-derived.
 
 See the [roadmap](ROADMAP.md) for the path from safe device sessions to MixiD parity and a daily-driver release.
 

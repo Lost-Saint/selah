@@ -5,8 +5,8 @@ use std::time::Duration;
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
 use super::protocol::{
-    ControlRequest, MonitorToggle, headphone_volume, monitor_toggle, phones_to_main_mix,
-    speaker_volume,
+    ControlRequest, MonitorToggle, channel_polarity, channel_volume, headphone_volume,
+    monitor_toggle, phones_to_main_mix, speaker_volume,
 };
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 
@@ -141,6 +141,45 @@ impl DeviceSession {
         on: bool,
     ) -> Result<(), SessionError> {
         let request = monitor_toggle(toggle, on, self.control_interface().number);
+        self.owner.send(&request).await
+    }
+
+    /// Sets one input channel's level using its Main-send cell pair.
+    ///
+    /// Both cell transfers run in order on this session, so a partial
+    /// left/right mismatch is reported instead of silently kept.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded USB transfer fails.
+    pub async fn set_channel_level(
+        &mut self,
+        level: NormalizedLevel,
+        channel: u8,
+    ) -> Result<(), SessionError> {
+        for request in channel_volume(level, channel, self.control_interface().number) {
+            self.owner.send(&request).await?;
+        }
+        Ok(())
+    }
+
+    /// Sets one input channel's polarity using the reference-derived request.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails.
+    pub async fn set_channel_polarity(
+        &mut self,
+        channel: u8,
+        flipped: bool,
+    ) -> Result<(), SessionError> {
+        let request = channel_polarity(channel, flipped, self.control_interface().number);
         self.owner.send(&request).await
     }
 

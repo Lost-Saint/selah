@@ -10,7 +10,8 @@ mod watch;
 
 pub use catalog::{AUDIENT_VENDOR_ID, DeviceModel, SUPPORTED_DEVICES, supported_device};
 pub use control::{
-    send_headphone_level, send_monitor_toggle, send_phones_to_main_mix, send_speaker_level,
+    send_channel_level, send_channel_polarity, send_headphone_level, send_monitor_toggle,
+    send_phones_to_main_mix, send_speaker_level,
 };
 pub use discovery::{
     DetectedDevice, DeviceLocation, DiscoveryReport, UnknownAudientDevice, discover,

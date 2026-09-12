@@ -25,6 +25,19 @@ const MAIN_MIX_ROUTES: [u8; 2] = [0x1b, 0x1c];
 // `wValue = masterVals[mode]`. `MixiD` keeps the on/off state in a local
 // dummy array, so Selah must present the result as sent, never confirmed.
 const MONITOR_TOGGLE_ENTITY: u16 = 0x3600;
+// Mixer matrix lives on entity `0x3c`: `MixiD` `set_channel_volume`
+// (driver.h) writes one input's Main-send pair as two cells,
+// `wValue = 0x0100 + channel * 6` (Main L) and `+ 1` (Main R). The two
+// transfers must succeed for the pair to stay matched. Per BiD's
+// measurements the pair is the input's stereo image (ratio = pan), so a
+// single level to both sums the input to the centre.
+const MIXER_MATRIX_ENTITY: u16 = 0x3c00;
+const MIXER_MATRIX_SELECTOR_BASE: u16 = 0x0100;
+const MIXER_MATRIX_CELL_STRIDE: u16 = 6;
+// Input polarity lives on entity `0x0b`: `MixiD` `set_phase_state`
+// writes a one-byte bool with `wValue = 0x0d01 + channel`.
+const POLARITY_ENTITY: u16 = 0x0b00;
+const POLARITY_SELECTOR_BASE: u16 = 0x0d01;
 
 /// A finite mixer level between silence (`0.0`) and full scale (`1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,6 +173,43 @@ pub(crate) fn monitor_toggle(
     }
 }
 
+/// Encodes one input channel's level as its Main-send cell pair.
+///
+/// `channel` is the running input index across microphone then digital
+/// inputs (not the per-group position: `MixiD`'s digital loop reuses its
+/// loop counter, aliasing digital channels onto microphone mappings, which
+/// Selah deliberately does not reproduce).
+///
+/// Both transfers must succeed for the pair to stay matched. This is
+/// one-way: the matrix does not read back, so callers must present the
+/// result as sent, never confirmed.
+pub(crate) fn channel_volume(
+    level: NormalizedLevel,
+    channel: u8,
+    interface_number: u8,
+) -> [ControlRequest; 2] {
+    let base = MIXER_MATRIX_SELECTOR_BASE + u16::from(channel) * MIXER_MATRIX_CELL_STRIDE;
+    [base, base + 1].map(|control| ControlRequest {
+        request: SET_CURRENT,
+        value: control,
+        index: MIXER_MATRIX_ENTITY | u16::from(interface_number),
+        payload: level.audient_value().to_le_bytes().to_vec(),
+    })
+}
+
+/// Encodes one input channel's polarity as the one-byte bool `MixiD` sends.
+///
+/// This is one-way: polarity does not read back, so callers must present
+/// the result as sent, never confirmed.
+pub(crate) fn channel_polarity(channel: u8, flipped: bool, interface_number: u8) -> ControlRequest {
+    ControlRequest {
+        request: SET_CURRENT,
+        value: POLARITY_SELECTOR_BASE + u16::from(channel),
+        index: POLARITY_ENTITY | u16::from(interface_number),
+        payload: vec![u8::from(flipped)],
+    }
+}
+
 /// Encodes routing the headphone pair to Main Mix as two channel requests.
 ///
 /// `MixiD` `routeToggle` rows 4 and 5 (HP L/R) select Main Mix with values
@@ -177,8 +227,8 @@ pub(crate) fn phones_to_main_mix(interface_number: u8) -> [ControlRequest; 2] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRequest, MonitorToggle, NormalizedLevel, headphone_volume, monitor_toggle,
-        phones_to_main_mix, speaker_volume,
+        ControlRequest, MonitorToggle, NormalizedLevel, channel_polarity, channel_volume,
+        headphone_volume, monitor_toggle, phones_to_main_mix, speaker_volume,
     };
 
     #[test]
@@ -284,5 +334,48 @@ mod tests {
     fn monitor_toggle_labels_match_the_reference_panel() {
         let labels = MonitorToggle::ALL.map(MonitorToggle::label);
         assert_eq!(labels, ["DIM", "ALT", "TB", "MONO", "MUTE"]);
+    }
+
+    #[test]
+    fn encodes_channel_volume_cell_pair() {
+        assert_eq!(
+            channel_volume(NormalizedLevel::new(1.0).unwrap(), 0, 4),
+            [
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0100,
+                    index: 0x3c04,
+                    payload: vec![0xff, 0xff],
+                },
+                ControlRequest {
+                    request: 0x01,
+                    value: 0x0101,
+                    index: 0x3c04,
+                    payload: vec![0xff, 0xff],
+                },
+            ]
+        );
+        // Channel 9 (last input on the iD14 MKII) strides by six cells.
+        for request in channel_volume(NormalizedLevel::new(0.0).unwrap(), 9, 4) {
+            assert_eq!(request.request, 0x01);
+            assert_eq!(request.index, 0x3c04);
+            assert_eq!(request.payload, vec![0x00, 0x80]);
+        }
+        let pair = channel_volume(NormalizedLevel::new(0.5).unwrap(), 9, 4);
+        assert_eq!([pair[0].value, pair[1].value], [0x0136, 0x0137]);
+    }
+
+    #[test]
+    fn encodes_channel_polarity_request() {
+        assert_eq!(
+            channel_polarity(2, true, 4),
+            ControlRequest {
+                request: 0x01,
+                value: 0x0d03,
+                index: 0x0b04,
+                payload: vec![0x01],
+            }
+        );
+        assert_eq!(channel_polarity(0, false, 4).payload, vec![0x00]);
     }
 }
