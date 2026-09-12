@@ -48,7 +48,7 @@ Selah has the application foundation with the Milestone 2 monitor slice and the 
 - CI, formatting, lint, and dependency-maintenance configuration;
 - a scoped Linux udev rule.
 
-The app sends the Milestone 2 monitor controls from the UI through serialized background tasks that claim and release the control interface per send, with pending, sent, and failed states and no state readback: speaker and headphone volume, a one-way phones-to-Main-Mix action, and DIM / ALT / TB / MONO / MUTE toggles, all gated to the iD14 MKII. It also shows a model-driven input mixer: one strip per microphone then digital input with a level fader and a polarity control, scrolling horizontally on high-channel-count models. Channel mute, solo, and stereo linking have no known USB mapping, so no control for them is shown. Control transfers were verified on an iD14 MKII without disturbing its Linux audio interfaces, but audible confirmation is unconfirmed (headphones-only setup), so all mappings stay reference-derived. A listening test found the volumes inaudible on that setup, likely because the phones are routed to a fixed-level feed rather than Main Mix (see `docs/protocol.md`); the routing action, toggles, and mixer strips await the same listening confirmation. A safe claim-and-release cycle was also physically verified on the same model, followed by 5 back-to-back session/volume cycles and a busy-interface forced-error probe with recovery, all leaving Linux audio working. The maintainer additionally verified GUI app-close while connected and physical unplug/replug with recovery. The unverified legs are audible listening confirmation and hardware permission-denied handling, which needs ACL/udev manipulation this environment cannot do without root; that path fails before any handle is acquired and its kind mapping is unit-tested.
+The app sends monitor, mixer, and capability-gated routing controls through background tasks that claim and release the control interface per operation, with pending, sent, failed, and unknown states and no state readback. Routing names physical output destinations and mix sources, supports per-output reset, and never derives a write from channel count alone. The input mixer remains one strip per microphone then digital input, with explicit ADAT numbering after onboard inputs. Channel mute, solo, stereo linking, and insert/send-return have no known USB mapping, so no working control is shown. Existing control transfers were verified on an iD14 MKII without disturbing Linux audio, but Selah's expanded routing writes still await the hardware checks recorded under Milestone 4. A safe claim-and-release cycle, repeated session/volume cycles, a busy-interface forced-error probe, GUI close, and unplug/replug recovery have all left Linux audio working. Hardware permission-denied handling remains unit-tested only because exercising it requires system ACL or udev changes.
 
 ## Milestone 1 — Safe device session
 
@@ -96,14 +96,14 @@ MixiD does not yet provide complete state readback, so Selah must not present a 
 
 **Outcome:** users can understand, change, and undo signal routing without guessing what a grid cell means.
 
-- Main Mix, Alt Speaker, Cue A, Cue B, and DAW Mix destinations where supported.
-- A clear route-off or reset action instead of a one-way selection, addressing [MixiD issue #11](https://github.com/TheOnlyJoey/MixiD/issues/11).
-- Output 3/4 and digital-output behavior, tracked in [MixiD issue #3](https://github.com/TheOnlyJoey/MixiD/issues/3).
-- Correct ADAT expansion mapping, including the iD22 report in [MixiD issue #25](https://github.com/TheOnlyJoey/MixiD/issues/25).
-- Insert and send/return behavior only after it is verified on capable hardware; see [MixiD issue #5](https://github.com/TheOnlyJoey/MixiD/issues/5).
-- Routing layouts derived from model capabilities rather than fixed six-channel tables.
+- Main Mix, Alt Speaker, Cue A, Cue B, and DAW Mix sources where supported. ✅ (iD14 MKII and iD24 reference-derived maps; no unsupported choices shown)
+- A clear route-off or reset action instead of a one-way selection, addressing [MixiD issue #11](https://github.com/TheOnlyJoey/MixiD/issues/11). ✅ (the protocol has no off state; Reset sends the destination's documented default)
+- Output 3/4 and digital-output behavior, tracked in [MixiD issue #3](https://github.com/TheOnlyJoey/MixiD/issues/3). ✅ (outputs 3/4 routing on both enabled profiles; evidenced iD24 ADAT/S/PDIF output format)
+- Correct ADAT expansion mapping, including the iD22 report in [MixiD issue #25](https://github.com/TheOnlyJoey/MixiD/issues/25). ✅ (ADAT 1–8 follow onboard inputs; output routing indexes are modeled separately)
+- Insert and send/return behavior only after it is verified on capable hardware; see [MixiD issue #5](https://github.com/TheOnlyJoey/MixiD/issues/5). ➖ (no verified mapping; capability remains visibly unavailable and sends nothing)
+- Routing layouts derived from model capabilities rather than fixed six-channel tables. ✅
 
-**Exit condition:** every available source and destination can be selected and cleared, and routing is verified on at least one compact interface and one digitally expanded interface.
+**Exit condition:** every available source and destination can be selected and reset. ✅ in code and hardware-independent tests. The source mappings are externally hardware-verified on an iD14 MKII and iD24; Selah's own transfers have not yet been physically verified on either model, so the hardware portion of this exit condition remains open.
 
 ## Milestone 5 — Device feedback and metering
 
@@ -157,6 +157,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The current target is **Milestone 4: Routing and extended outputs**, building a clear source/destination model on the session and honest-state patterns. All control mappings stay reference-derived until audible changes are confirmed on hardware. The architecture must remain capability-driven and avoid baking in one model's channel layout.
+The current target remains **Milestone 4 hardware verification**. Its capability-driven implementation is code-complete, but the Selah-specific compact and digitally expanded device checks above remain before Milestone 5 begins.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.

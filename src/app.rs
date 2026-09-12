@@ -4,14 +4,20 @@ use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 use crate::device::{
     DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, MonitorToggle,
     UnknownAudientDevice, discover, send_channel_level, send_channel_polarity,
-    send_headphone_level, send_monitor_toggle, send_phones_to_main_mix, send_speaker_level,
-    watch_events,
+    send_digital_output_mode, send_headphone_level, send_monitor_toggle, send_output_route,
+    send_speaker_level, watch_events,
 };
 use crate::mixer::{ChannelStrip, channel_name, mixer_available, mixer_channel_count};
 use crate::monitor::{
     ToggleControl, VolumeControl, monitor_controls_available, monitor_toggles_available,
 };
-use crate::routing::{RouteControl, phones_main_mix_available};
+use crate::routing::{
+    DigitalOutputMode, OutputRouteControl, Route, RouteStatus, RoutingDestination,
+    digital_output_mode_available, reset_route, routing_available,
+};
+
+mod route_state;
+use route_state::fresh_routes;
 
 struct App {
     status: DeviceStatus,
@@ -20,7 +26,8 @@ struct App {
     watch_status: WatchStatus,
     speaker: VolumeControl,
     headphone: VolumeControl,
-    routing: RouteControl,
+    routes: Vec<OutputRouteControl>,
+    digital_output_mode: ToggleControl,
     toggles: [ToggleControl; 5],
     channels: Vec<ChannelStrip>,
 }
@@ -68,6 +75,20 @@ struct ChannelPolarityOutcome {
     result: Result<(), String>,
 }
 
+/// Outcome of one output-pair routing send. The complete typed route is its
+/// identity, so a completion from an older attachment cannot update new state.
+#[derive(Clone, Debug)]
+struct RoutingOutcome {
+    route: Route,
+    result: Result<(), String>,
+}
+
+#[derive(Clone, Debug)]
+struct DigitalOutputModeOutcome {
+    mode: DigitalOutputMode,
+    result: Result<(), String>,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
@@ -77,8 +98,11 @@ enum Message {
     SpeakerVolumeFinished(SpeakerVolumeOutcome),
     HeadphoneVolumeChanged(f32),
     HeadphoneVolumeFinished(HeadphoneVolumeOutcome),
-    RoutePhonesToMainMix,
-    RoutingFinished(Result<(), String>),
+    RouteSelected(Route),
+    RouteReset(RoutingDestination),
+    RoutingFinished(RoutingOutcome),
+    DigitalOutputModeSelected(DigitalOutputMode),
+    DigitalOutputModeFinished(DigitalOutputModeOutcome),
     MonitorToggleChanged { toggle: MonitorToggle, on: bool },
     MonitorToggleFinished(MonitorToggleOutcome),
     ChannelLevelChanged { channel: u8, level: f32 },
@@ -121,7 +145,8 @@ impl App {
                 watch_status: WatchStatus::Starting,
                 speaker: VolumeControl::default(),
                 headphone: VolumeControl::default(),
-                routing: RouteControl::default(),
+                routes: Vec::new(),
+                digital_output_mode: ToggleControl::default(),
                 toggles: Default::default(),
                 channels: Vec::new(),
             },
@@ -163,7 +188,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
-            app.routing = RouteControl::default();
+            app.routes = fresh_routes(&app.status);
+            app.digital_output_mode = ToggleControl::default();
             app.channels = fresh_channels(&app.status);
             finish_scan(app)
         }
@@ -176,7 +202,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
-            app.routing = RouteControl::default();
+            app.routes = Vec::new();
+            app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
             finish_scan(app)
         }
@@ -186,7 +213,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
-            app.routing = RouteControl::default();
+            app.routes = Vec::new();
+            app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
             finish_scan(app)
         }
@@ -196,7 +224,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
-            app.routing = RouteControl::default();
+            app.routes = Vec::new();
+            app.digital_output_mode = ToggleControl::default();
             app.channels = Vec::new();
             finish_scan(app)
         }
@@ -204,8 +233,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::SpeakerVolumeFinished(outcome) => finish_speaker_volume(app, outcome),
         Message::HeadphoneVolumeChanged(level) => request_headphone_volume(app, level),
         Message::HeadphoneVolumeFinished(outcome) => finish_headphone_volume(app, outcome),
-        Message::RoutePhonesToMainMix => request_routing(app),
-        Message::RoutingFinished(result) => finish_routing(app, result),
+        Message::RouteSelected(route) => request_routing(app, route),
+        Message::RouteReset(destination) => request_route_reset(app, destination),
+        Message::RoutingFinished(outcome) => finish_routing(app, outcome),
+        Message::DigitalOutputModeSelected(mode) => request_digital_output_mode(app, mode),
+        Message::DigitalOutputModeFinished(outcome) => finish_digital_output_mode(app, outcome),
         Message::MonitorToggleChanged { toggle, on } => request_monitor_toggle(app, toggle, on),
         Message::MonitorToggleFinished(outcome) => finish_monitor_toggle(app, outcome),
         Message::ChannelLevelChanged { channel, level } => {
@@ -310,32 +342,94 @@ fn finish_headphone_volume(app: &mut App, outcome: HeadphoneVolumeOutcome) -> Ta
     }
 }
 
-/// Starts a one-way phones-to-Main-Mix send; ignored while one is in flight.
+fn route_control(
+    app: &mut App,
+    destination: RoutingDestination,
+) -> Option<&mut OutputRouteControl> {
+    app.routes
+        .iter_mut()
+        .find(|output| output.destination == destination)
+}
+
+/// Starts a named output route; ignored while that output has one in flight.
 ///
 /// The USB work runs in the returned task, away from Iced's UI thread.
-fn request_routing(app: &mut App) -> Task<Message> {
+fn request_routing(app: &mut App, route: Route) -> Task<Message> {
     let Some(device) = selected_device(app) else {
         return Task::none();
     };
+    let Some(output) = route_control(app, route.destination) else {
+        return Task::none();
+    };
 
-    match app.routing.request() {
-        Some(()) => routing_task(device),
+    match output.control.request(route.source) {
+        Some(_) => routing_task(device, route),
         None => Task::none(),
     }
 }
 
+fn request_route_reset(app: &mut App, destination: RoutingDestination) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+    let Ok(route) = reset_route(device.model, destination) else {
+        return Task::none();
+    };
+    request_routing(app, route)
+}
+
 /// Records a routing send result; stale completions after a rescan are ignored.
-fn finish_routing(app: &mut App, result: Result<(), String>) -> Task<Message> {
-    if !app.routing.is_sending() {
+fn finish_routing(app: &mut App, outcome: RoutingOutcome) -> Task<Message> {
+    let RoutingOutcome { route, result } = outcome;
+    let Some(output) = route_control(app, route.destination) else {
+        return Task::none();
+    };
+    if !output.control.is_in_flight(route.source) {
         return Task::none();
     }
 
     match &result {
-        Ok(()) => tracing::info!("Phones routed to Main Mix"),
-        Err(error) => tracing::warn!(%error, "Phones routing send failed"),
+        Ok(()) => tracing::info!(
+            destination = %route.destination.label(),
+            source = route.source.label(),
+            "Output route sent"
+        ),
+        Err(error) => tracing::warn!(
+            destination = %route.destination.label(),
+            source = route.source.label(),
+            %error,
+            "Output route send failed"
+        ),
     }
 
-    app.routing.finish(result);
+    let _ = output.control.finish(route.source, result);
+    Task::none()
+}
+
+fn request_digital_output_mode(app: &mut App, mode: DigitalOutputMode) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+    if !digital_output_mode_available(&device) {
+        return Task::none();
+    }
+    match app.digital_output_mode.request(mode.as_toggle()) {
+        Some(_) => digital_output_mode_task(device, mode),
+        None => Task::none(),
+    }
+}
+
+fn finish_digital_output_mode(app: &mut App, outcome: DigitalOutputModeOutcome) -> Task<Message> {
+    let DigitalOutputModeOutcome { mode, result } = outcome;
+    let value = mode.as_toggle();
+    if !app.digital_output_mode.is_in_flight(value) {
+        return Task::none();
+    }
+    match &result {
+        Ok(()) => tracing::info!(mode = mode.label(), "Digital output mode sent"),
+        Err(error) => tracing::warn!(mode = mode.label(), %error, "Digital output mode failed"),
+    }
+    let _ = app.digital_output_mode.finish(value, result);
     Task::none()
 }
 
@@ -500,10 +594,27 @@ fn headphone_task(device: DetectedDevice, level: f32) -> Task<Message> {
     )
 }
 
-fn routing_task(device: DetectedDevice) -> Task<Message> {
+fn routing_task(device: DetectedDevice, route: Route) -> Task<Message> {
     Task::perform(
-        async move { send_phones_to_main_mix(device).await },
+        async move {
+            RoutingOutcome {
+                route,
+                result: send_output_route(device, route).await,
+            }
+        },
         Message::RoutingFinished,
+    )
+}
+
+fn digital_output_mode_task(device: DetectedDevice, mode: DigitalOutputMode) -> Task<Message> {
+    Task::perform(
+        async move {
+            DigitalOutputModeOutcome {
+                mode,
+                result: send_digital_output_mode(device, mode).await,
+            }
+        },
+        Message::DigitalOutputModeFinished,
     )
 }
 
@@ -615,7 +726,8 @@ fn view(app: &App) -> Element<'_, Message> {
             &app.status,
             &app.speaker,
             &app.headphone,
-            &app.routing,
+            &app.routes,
+            &app.digital_output_mode,
             &app.toggles,
             &app.channels
         ))
@@ -633,7 +745,10 @@ fn view(app: &App) -> Element<'_, Message> {
     .width(Fill)
     .max_width(680);
 
-    container(content).center(Fill).padding(40).into()
+    container(scrollable(content).width(Fill))
+        .center_x(Fill)
+        .padding(40)
+        .into()
 }
 
 fn watch_status(app: &App) -> &'static str {
@@ -648,7 +763,8 @@ fn status_view<'a>(
     status: &'a DeviceStatus,
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
-    routing: &'a RouteControl,
+    routes: &'a [OutputRouteControl],
+    digital_output_mode: &'a ToggleControl,
     toggles: &'a [ToggleControl; 5],
     channels: &'a [ChannelStrip],
 ) -> Element<'a, Message> {
@@ -671,9 +787,15 @@ fn status_view<'a>(
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => {
-            supported_view(report, speaker, headphone, routing, toggles, channels)
-        }
+        DeviceStatus::Ready(report) => supported_view(
+            report,
+            speaker,
+            headphone,
+            routes,
+            digital_output_mode,
+            toggles,
+            channels,
+        ),
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -690,7 +812,8 @@ fn supported_view<'a>(
     report: &'a DiscoveryReport,
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
-    routing: &'a RouteControl,
+    routes: &'a [OutputRouteControl],
+    digital_output_mode: &'a ToggleControl,
     toggles: &'a [ToggleControl; 5],
     channels: &'a [ChannelStrip],
 ) -> Element<'a, Message> {
@@ -740,10 +863,40 @@ fn supported_view<'a>(
         ));
     }
 
-    // One-way and iD14 MKII-only: MixiD's six-channel table matches that
-    // layout, and Selah cannot read routing back or restore the old route.
-    if phones_main_mix_available(device) {
-        content = content.push(routing_button(routing));
+    if routing_available(device) {
+        content = content.push(routing_view(model, routes));
+    } else if model.routing.is_some() {
+        content = content.push(
+            column![
+                text("Output routing").size(16),
+                text("Unavailable until Selah can use a safe control interface.")
+                    .size(13)
+                    .style(text::secondary),
+            ]
+            .spacing(6),
+        );
+    } else if model.analog_outputs > 2 || model.digital_outputs > 0 {
+        content = content.push(
+            column![
+                text("Output routing").size(16),
+                text("Unavailable on this model: its routing codes are not verified, so Selah will not guess.")
+                    .size(13)
+                    .style(text::secondary),
+            ]
+            .spacing(6),
+        );
+    }
+
+    if digital_output_mode_available(device) {
+        content = content.push(digital_output_mode_view(digital_output_mode));
+    }
+
+    if model.inserts > 0 {
+        content = content.push(
+            text("Insert and send/return routing is unavailable: no verified USB mapping exists yet.")
+                .size(13)
+                .style(text::secondary),
+        );
     }
 
     // Monitor toggles share the same gate: the `0x36` toggle table is
@@ -785,20 +938,107 @@ fn volume_slider<'a>(
     .into()
 }
 
-/// One-way phones-to-Main-Mix action without implying confirmed device state.
-///
-/// Selah cannot read routing back, so the button reports what was sent —
-/// never what the device is confirmed to hold — and warns that it cannot be
-/// undone from here.
-fn routing_button(routing: &RouteControl) -> Element<'_, Message> {
-    let sending = matches!(routing.status(), crate::routing::RouteStatus::Sending);
-    column![
-        text("Phones routing").size(16),
-        button(text("Route phones to Main Mix"))
-            .on_press_maybe((!sending).then_some(Message::RoutePhonesToMainMix)),
-        text(routing.status_text()).size(13).style(text::secondary),
+/// Compact output-oriented routing. Rows name physical destinations and only
+/// offer sources present in the connected model's capability data.
+fn routing_view<'a>(
+    model: &'a crate::device::DeviceModel,
+    routes: &'a [OutputRouteControl],
+) -> Element<'a, Message> {
+    let Some(capabilities) = model.routing else {
+        return column![].into();
+    };
+    let mut section = column![
+        text("Output routing").size(16),
+        text("Choose what each output pair plays. Reset sends that output’s documented default; routes are not read back.")
+            .size(13)
+            .style(text::secondary),
     ]
-    .spacing(8)
+    .spacing(10);
+
+    for output in routes {
+        let sending = matches!(output.control.status(), RouteStatus::Sending { .. });
+        let requested = output.control.requested();
+        let mut choices = row![].spacing(6).align_y(Alignment::Center);
+        for &source in capabilities.sources {
+            let label = if requested == Some(source) {
+                format!("{} · requested", source.label())
+            } else {
+                source.label().to_owned()
+            };
+            choices = choices.push(button(text(label).size(13)).on_press_maybe(
+                (!sending).then_some(Message::RouteSelected(Route {
+                    destination: output.destination,
+                    source,
+                })),
+            ));
+        }
+        choices = choices.push(
+            button(text("Reset").size(13))
+                .on_press_maybe((!sending).then_some(Message::RouteReset(output.destination))),
+        );
+        section = section.push(
+            column![
+                text(output.destination.label()).size(14),
+                scrollable(choices).direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default(),
+                )),
+                text(output.control.status_text())
+                    .size(12)
+                    .style(text::secondary),
+            ]
+            .spacing(6),
+        );
+    }
+    section.into()
+}
+
+fn digital_output_mode_view(control: &ToggleControl) -> Element<'_, Message> {
+    use crate::monitor::ToggleStatus;
+
+    let sending = matches!(control.status(), ToggleStatus::Sending { .. });
+    let known_request = !matches!(control.status(), ToggleStatus::Unknown);
+    let requested_adat = known_request && control.position();
+    let requested_spdif = known_request && !control.position();
+    let status = match control.status() {
+        ToggleStatus::Unknown => "Hardware format unknown — choose a format to send it.".to_owned(),
+        ToggleStatus::Sending { sending } => {
+            format!("Sending {}…", if sending { "ADAT" } else { "S/PDIF" })
+        }
+        ToggleStatus::Sent { on } => format!(
+            "Last sent {} — accepted, not read back from the device.",
+            if on { "ADAT" } else { "S/PDIF" }
+        ),
+        ToggleStatus::Failed { error, .. } => {
+            format!("Format send failed: {error} Choose a format to retry.")
+        }
+    };
+    column![
+        text("Digital output format").size(16),
+        text("ADAT carries eight optical channels; S/PDIF carries one stereo pair.")
+            .size(13)
+            .style(text::secondary),
+        row![
+            button(text(if requested_adat {
+                "ADAT · requested"
+            } else {
+                "ADAT"
+            }))
+            .on_press_maybe(
+                (!sending).then_some(Message::DigitalOutputModeSelected(DigitalOutputMode::Adat,))
+            ),
+            button(text(if requested_spdif {
+                "S/PDIF · requested"
+            } else {
+                "S/PDIF"
+            }))
+            .on_press_maybe(
+                (!sending).then_some(Message::DigitalOutputModeSelected(DigitalOutputMode::Spdif,))
+            ),
+        ]
+        .spacing(6),
+        text(status).size(12).style(text::secondary),
+    ]
+    .spacing(6)
     .into()
 }
 
@@ -959,15 +1199,19 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ChannelLevelOutcome, ChannelPolarityOutcome, DeviceStatus, HeadphoneVolumeOutcome,
-        Message, MonitorToggleOutcome, SpeakerVolumeOutcome, finish_scan, request_scan,
-        toggle_index, update,
+        App, ChannelLevelOutcome, ChannelPolarityOutcome, DeviceStatus, DigitalOutputModeOutcome,
+        HeadphoneVolumeOutcome, Message, MonitorToggleOutcome, RoutingOutcome,
+        SpeakerVolumeOutcome, finish_scan, fresh_routes, request_scan, route_control, toggle_index,
+        update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
         MonitorToggle,
     };
     use crate::monitor::{ToggleStatus, VolumeStatus};
+    use crate::routing::{
+        DigitalOutputMode, Route, RouteStatus, RoutingDestination, RoutingSource,
+    };
 
     #[test]
     fn scan_requests_are_coalesced_while_a_scan_is_running() {
@@ -1272,80 +1516,145 @@ mod tests {
 
     #[test]
     fn routing_request_without_a_device_is_ignored() {
-        use crate::routing::RouteStatus;
-
         let (mut app, _startup) = App::new();
-
-        let _ignored = update(&mut app, Message::RoutePhonesToMainMix);
-        assert_eq!(app.routing.status(), RouteStatus::Unknown);
+        let route = headphone_route(RoutingSource::MainMix);
+        let _ignored = update(&mut app, Message::RouteSelected(route));
+        assert!(app.routes.is_empty());
     }
 
     #[test]
     fn routing_moves_from_unknown_through_sending_to_sent() {
-        use crate::routing::RouteStatus;
-
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
+        app.routes = fresh_routes(&app.status);
+        let route = headphone_route(RoutingSource::MainMix);
 
-        let _send = update(&mut app, Message::RoutePhonesToMainMix);
-        assert_eq!(app.routing.status(), RouteStatus::Sending);
+        let _send = update(&mut app, Message::RouteSelected(route));
+        assert_eq!(
+            route_control(&mut app, route.destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Sending {
+                source: route.source
+            }
+        );
 
-        let _done = update(&mut app, Message::RoutingFinished(Ok(())));
-        assert_eq!(app.routing.status(), RouteStatus::Sent);
-    }
-
-    #[test]
-    fn routing_failure_reports_the_error() {
-        use crate::routing::RouteStatus;
-
-        let (mut app, _startup) = App::new();
-        app.status = DeviceStatus::Ready(report_with_control());
-
-        let _send = update(&mut app, Message::RoutePhonesToMainMix);
-        let _failed = update(
+        let _done = update(
             &mut app,
-            Message::RoutingFinished(Err("no device".to_owned())),
+            Message::RoutingFinished(RoutingOutcome {
+                route,
+                result: Ok(()),
+            }),
         );
         assert_eq!(
-            app.routing.status(),
-            RouteStatus::Failed {
-                error: "no device".to_owned(),
-                ever_sent: false,
+            route_control(&mut app, route.destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Sent {
+                source: route.source
             }
         );
     }
 
     #[test]
-    fn second_routing_request_while_sending_is_ignored() {
-        use crate::routing::RouteStatus;
-
+    fn routing_failure_reports_the_error() {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
+        app.routes = fresh_routes(&app.status);
+        let route = headphone_route(RoutingSource::CueB);
 
-        let _first = update(&mut app, Message::RoutePhonesToMainMix);
-        let _second = update(&mut app, Message::RoutePhonesToMainMix);
-        assert_eq!(app.routing.status(), RouteStatus::Sending);
+        let _send = update(&mut app, Message::RouteSelected(route));
+        let _failed = update(
+            &mut app,
+            Message::RoutingFinished(RoutingOutcome {
+                route,
+                result: Err("no device".to_owned()),
+            }),
+        );
+        assert_eq!(
+            route_control(&mut app, route.destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Failed {
+                error: "no device".to_owned(),
+                last_sent: None,
+            }
+        );
+    }
 
-        let _done = update(&mut app, Message::RoutingFinished(Ok(())));
-        assert_eq!(app.routing.status(), RouteStatus::Sent);
+    #[test]
+    fn reset_sends_the_documented_default() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.routes = fresh_routes(&app.status);
+        let destination = RoutingDestination::Outputs3And4;
+
+        let _send = update(&mut app, Message::RouteReset(destination));
+        assert_eq!(
+            route_control(&mut app, destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Sending {
+                source: RoutingSource::DawMix
+            }
+        );
     }
 
     #[test]
     fn stale_routing_completion_after_a_rescan_is_ignored() {
-        use crate::routing::RouteStatus;
-
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
+        app.routes = fresh_routes(&app.status);
+        let route = headphone_route(RoutingSource::MainMix);
 
-        let _send = update(&mut app, Message::RoutePhonesToMainMix);
+        let _send = update(&mut app, Message::RouteSelected(route));
         let _rescan = update(
             &mut app,
             Message::DiscoveryFinished(Ok(DiscoveryReport::default())),
         );
-        let _stale = update(&mut app, Message::RoutingFinished(Ok(())));
+        let _stale = update(
+            &mut app,
+            Message::RoutingFinished(RoutingOutcome {
+                route,
+                result: Ok(()),
+            }),
+        );
 
         assert!(matches!(app.status, DeviceStatus::Empty));
-        assert_eq!(app.routing.status(), RouteStatus::Unknown);
+        assert!(app.routes.is_empty());
+    }
+
+    #[test]
+    fn digital_output_mode_is_pending_then_sent_without_claiming_readback() {
+        let (mut app, _startup) = App::new();
+        let mut report = report_with_control();
+        report.supported[0].model = crate::device::supported_device(0x000d).unwrap();
+        app.status = DeviceStatus::Ready(report);
+
+        let _send = update(
+            &mut app,
+            Message::DigitalOutputModeSelected(DigitalOutputMode::Adat),
+        );
+        assert_eq!(
+            app.digital_output_mode.status(),
+            ToggleStatus::Sending { sending: true }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::DigitalOutputModeFinished(DigitalOutputModeOutcome {
+                mode: DigitalOutputMode::Adat,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.digital_output_mode.status(),
+            ToggleStatus::Sent { on: true }
+        );
     }
 
     #[test]
@@ -1835,6 +2144,13 @@ mod tests {
         std::iter::repeat_with(crate::mixer::ChannelStrip::default)
             .take(10)
             .collect()
+    }
+
+    fn headphone_route(source: RoutingSource) -> Route {
+        Route {
+            destination: RoutingDestination::Headphones,
+            source,
+        }
     }
 
     fn report_with_control() -> DiscoveryReport {

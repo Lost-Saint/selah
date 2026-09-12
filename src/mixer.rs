@@ -8,6 +8,7 @@
 
 use crate::device::{DetectedDevice, DeviceModel};
 use crate::monitor::{ToggleControl, VolumeControl};
+use crate::routing::{AdatChannel, adat_input_mixer_index};
 
 /// Live send state for one input channel strip.
 #[derive(Clone, Debug, Default)]
@@ -33,7 +34,14 @@ pub fn channel_name(model: &DeviceModel, index: u8) -> String {
     if index < model.mic_inputs {
         format!("Mic {}", index + 1)
     } else {
-        format!("Digi {}", index - model.mic_inputs + 1)
+        let digital = index - model.mic_inputs + 1;
+        if let Some(adat) = AdatChannel::new(digital)
+            && adat_input_mixer_index(model, adat) == Ok(index)
+        {
+            format!("ADAT {digital}")
+        } else {
+            format!("Digital {digital}")
+        }
     }
 }
 
@@ -73,8 +81,8 @@ mod tests {
         let model = crate::device::supported_device(0x0008).unwrap();
         assert_eq!(channel_name(model, 0), "Mic 1");
         assert_eq!(channel_name(model, 1), "Mic 2");
-        assert_eq!(channel_name(model, 2), "Digi 1");
-        assert_eq!(channel_name(model, 9), "Digi 8");
+        assert_eq!(channel_name(model, 2), "ADAT 1");
+        assert_eq!(channel_name(model, 9), "ADAT 8");
     }
 
     #[test]

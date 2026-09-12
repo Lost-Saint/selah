@@ -1,6 +1,10 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use crate::routing::{
+    DigitalOutputMode, InvalidRoute, Route, RoutingScheme, RoutingSource, validate_route,
+};
+
 const SET_CURRENT: u8 = 0x01;
 const SPEAKER_VOLUME_CONTROL: u16 = 0x1200;
 const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
@@ -12,14 +16,15 @@ const SPEAKER_OUTPUT_ENTITY: u16 = 0x3600;
 // (see docs/protocol.md).
 const HEADPHONE_VOLUME_CONTROLS: [u16; 2] = [0x0203, 0x0204];
 const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0c00;
-// Phones-to-Main-Mix routing lives on mixer entity `0x33`: `MixiD`
-// `set_routing_value` (driver.h) writes one byte per channel with
-// `wValue = chanVals[chan]`. Channels 4 and 5 are HP L/R; position 0 is
-// Main Mix (`0x1b` left, `0x1c` right). Both transfers must succeed for
-// the pair to stay matched.
+// Output routing lives on entity `0x33`, selector `0x06`. The selected
+// model capability supplies actual output indexes; source bytes use either
+// MixiD's iD14 table or BiD's externally verified iD24 mapping.
 const ROUTING_ENTITY: u16 = 0x3300;
-const PHONES_ROUTE_CONTROLS: [u16; 2] = [0x0604, 0x0605];
-const MAIN_MIX_ROUTES: [u8; 2] = [0x1b, 0x1c];
+const ROUTING_SELECTOR: u16 = 0x0600;
+// Official-app decoding in Monix/BiD identifies optical-output mode as a
+// four-byte little-endian value: 0 = ADAT, 1 = S/PDIF.
+const DIGITAL_OUTPUT_MODE_ENTITY: u16 = 0x1400;
+const DIGITAL_OUTPUT_MODE_CONTROL: u16 = 0x0100;
 // Monitor toggles live on the monitor entity `0x36`: `MixiD`
 // `set_bool_state` (driver.h) writes a one-byte bool with
 // `wValue = masterVals[mode]`. `MixiD` keeps the on/off state in a local
@@ -210,26 +215,66 @@ pub(crate) fn channel_polarity(channel: u8, flipped: bool, interface_number: u8)
     }
 }
 
-/// Encodes routing the headphone pair to Main Mix as two channel requests.
+/// Encodes a validated named route for both halves of a physical output pair.
 ///
-/// `MixiD` `routeToggle` rows 4 and 5 (HP L/R) select Main Mix with values
-/// `0x1b` and `0x1c`. This is one-way: Selah cannot read the current route
-/// back, so callers must present the result as sent, never confirmed.
-pub(crate) fn phones_to_main_mix(interface_number: u8) -> [ControlRequest; 2] {
-    std::array::from_fn(|i| ControlRequest {
+/// Validation happens before any request is returned, so callers cannot send
+/// a source, destination, or channel index outside the selected model's
+/// capability table.
+pub(crate) fn output_route(
+    model: &crate::device::DeviceModel,
+    route: Route,
+    interface_number: u8,
+) -> Result<[ControlRequest; 2], InvalidRoute> {
+    let (capabilities, output) = validate_route(model, route)?;
+    Ok(std::array::from_fn(|side| {
+        let channel = output.channels[side];
+        ControlRequest {
+            request: SET_CURRENT,
+            value: ROUTING_SELECTOR | u16::from(channel),
+            index: ROUTING_ENTITY | u16::from(interface_number),
+            payload: vec![route_code(capabilities.scheme, route.source, channel)],
+        }
+    }))
+}
+
+fn route_code(scheme: RoutingScheme, source: RoutingSource, output_channel: u8) -> u8 {
+    let side = output_channel & 1;
+    match (scheme, source) {
+        (RoutingScheme::Id14Table, RoutingSource::MainMix) => 0x1b + side,
+        (RoutingScheme::Id14Table, RoutingSource::AltSpeaker) => unreachable!("validated out"),
+        (RoutingScheme::Id14Table, RoutingSource::CueA) => 0x19,
+        (RoutingScheme::Id14Table, RoutingSource::CueB) => 0x1a,
+        (RoutingScheme::Id14Table | RoutingScheme::Id24Formula, RoutingSource::DawMix) => {
+            output_channel
+        }
+        (RoutingScheme::Id24Formula, RoutingSource::MainMix) => 0x25 + side,
+        (RoutingScheme::Id24Formula, RoutingSource::AltSpeaker) => 0x27 + side,
+        (RoutingScheme::Id24Formula, RoutingSource::CueA) => 0x1e + side,
+        (RoutingScheme::Id24Formula, RoutingSource::CueB) => 0x20 + side,
+    }
+}
+
+/// Encodes the evidenced iD24 optical-output mode request.
+pub(crate) fn digital_output_mode(mode: DigitalOutputMode, interface_number: u8) -> ControlRequest {
+    let value = match mode {
+        DigitalOutputMode::Adat => 0_u32,
+        DigitalOutputMode::Spdif => 1_u32,
+    };
+    ControlRequest {
         request: SET_CURRENT,
-        value: PHONES_ROUTE_CONTROLS[i],
-        index: ROUTING_ENTITY | u16::from(interface_number),
-        payload: vec![MAIN_MIX_ROUTES[i]],
-    })
+        value: DIGITAL_OUTPUT_MODE_CONTROL,
+        index: DIGITAL_OUTPUT_MODE_ENTITY | u16::from(interface_number),
+        payload: value.to_le_bytes().to_vec(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ControlRequest, MonitorToggle, NormalizedLevel, channel_polarity, channel_volume,
-        headphone_volume, monitor_toggle, phones_to_main_mix, speaker_volume,
+        digital_output_mode, headphone_volume, monitor_toggle, output_route, speaker_volume,
     };
+    use crate::routing::{DigitalOutputMode, Route, RoutingDestination, RoutingSource};
 
     #[test]
     fn rejects_invalid_normalized_levels() {
@@ -287,23 +332,92 @@ mod tests {
     }
 
     #[test]
-    fn encodes_phones_to_main_mix_requests() {
+    fn encodes_id14_output_routes_at_minimum_and_maximum_channels() {
+        let model = crate::device::supported_device(0x0008).unwrap();
         assert_eq!(
-            phones_to_main_mix(4),
+            output_route(
+                model,
+                Route {
+                    destination: RoutingDestination::MainSpeakers,
+                    source: RoutingSource::MainMix,
+                },
+                4
+            )
+            .unwrap(),
             [
                 ControlRequest {
                     request: 0x01,
-                    value: 0x0604,
+                    value: 0x0600,
                     index: 0x3304,
                     payload: vec![0x1b],
                 },
                 ControlRequest {
                     request: 0x01,
-                    value: 0x0605,
+                    value: 0x0601,
                     index: 0x3304,
                     payload: vec![0x1c],
                 },
             ]
+        );
+        let phones = output_route(
+            model,
+            Route {
+                destination: RoutingDestination::Headphones,
+                source: RoutingSource::DawMix,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!([phones[0].value, phones[1].value], [0x0604, 0x0605]);
+        assert_eq!([phones[0].payload[0], phones[1].payload[0]], [4, 5]);
+    }
+
+    #[test]
+    fn encodes_id24_extended_outputs() {
+        let model = crate::device::supported_device(0x000d).unwrap();
+        let line = output_route(
+            model,
+            Route {
+                destination: RoutingDestination::Outputs3And4,
+                source: RoutingSource::AltSpeaker,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!([line[0].value, line[1].value], [0x0602, 0x0603]);
+        assert_eq!([line[0].payload[0], line[1].payload[0]], [0x27, 0x28]);
+    }
+
+    #[test]
+    fn encodes_bounded_id24_digital_output_modes() {
+        assert_eq!(
+            digital_output_mode(DigitalOutputMode::Adat, 4),
+            ControlRequest {
+                request: 0x01,
+                value: 0x0100,
+                index: 0x1404,
+                payload: vec![0, 0, 0, 0],
+            }
+        );
+        assert_eq!(
+            digital_output_mode(DigitalOutputMode::Spdif, 4).payload,
+            vec![1, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_route_before_encoding() {
+        let model = crate::device::supported_device(0x0008).unwrap();
+        assert!(
+            output_route(
+                model,
+                Route {
+                    destination: RoutingDestination::Headphones,
+                    source: RoutingSource::AltSpeaker,
+                },
+                4
+            )
+            .is_err()
         );
     }
 

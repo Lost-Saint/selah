@@ -1,13 +1,13 @@
-//! Monitor volume and one-way routing sends over short-lived safe sessions.
+//! Control sends over short-lived safe sessions.
 //!
-//! Each send opens a session, transfers bounded requests (two for headphones
-//! and for phones-to-Main-Mix, in order on the same session), and always
-//! closes the session. These run inside Iced background tasks, away from the
-//! UI thread. Validation happens before any USB I/O. Errors are formatted
-//! with a recovery hint at this boundary; typed [`SessionError`] distinctions
-//! stay inside the transport.
+//! Each send opens a session, transfers its bounded request sequence in order,
+//! and always closes the session. These run inside Iced background tasks, away
+//! from the UI thread. Validation happens before any USB I/O. Errors are
+//! formatted with a recovery hint at this boundary; typed [`SessionError`]
+//! distinctions stay inside the transport.
 
 use super::{DetectedDevice, DeviceSession, MonitorToggle, NormalizedLevel, SessionError};
+use crate::routing::{DigitalOutputMode, Route, digital_output_mode_available, validate_route};
 
 /// Sends one bounded speaker volume request and always closes the session.
 ///
@@ -33,18 +33,34 @@ pub async fn send_headphone_level(device: DetectedDevice, level: f32) -> Result<
     close_after_send(session, send).await
 }
 
-/// Routes the headphone pair to Main Mix and always closes the session.
-///
-/// This is one-way with no readback and no restore; callers must present the
-/// result as sent, never confirmed.
+/// Sends one validated output route and always closes the session.
 ///
 /// # Errors
 ///
 /// Returns a message with a recovery hint when opening, sending, or closing
 /// fails.
-pub async fn send_phones_to_main_mix(device: DetectedDevice) -> Result<(), String> {
+pub async fn send_output_route(device: DetectedDevice, route: Route) -> Result<(), String> {
+    validate_route(device.model, route).map_err(|error| error.to_string())?;
     let mut session = open_session(&device).await?;
-    let send = session.set_phones_to_main_mix().await;
+    let send = session.set_output_route(route).await;
+    close_after_send(session, send).await
+}
+
+/// Sends one evidenced optical-output mode request and always closes the session.
+///
+/// # Errors
+///
+/// Returns an error before USB I/O when the model does not expose this
+/// capability, or when opening, sending, or closing fails.
+pub async fn send_digital_output_mode(
+    device: DetectedDevice,
+    mode: DigitalOutputMode,
+) -> Result<(), String> {
+    if !digital_output_mode_available(&device) {
+        return Err("digital output mode is unavailable for this model".to_owned());
+    }
+    let mut session = open_session(&device).await?;
+    let send = session.set_digital_output_mode(mode).await;
     close_after_send(session, send).await
 }
 
@@ -152,5 +168,36 @@ async fn close_after_send(
             }
             Err(format!("{error} — {}", error.recovery_hint()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::future::block_on;
+
+    use super::send_output_route;
+    use crate::device::{DetectedDevice, DeviceLocation};
+    use crate::routing::{Route, RoutingDestination, RoutingSource};
+
+    #[test]
+    fn invalid_route_is_rejected_before_opening_usb() {
+        let device = DetectedDevice {
+            location: DeviceLocation {
+                bus: "no-such-bus".to_owned(),
+                address: u8::MAX,
+            },
+            model: crate::device::supported_device(0x0008).unwrap(),
+            reported_name: None,
+            control_interface: None,
+        };
+        let error = block_on(send_output_route(
+            device,
+            Route {
+                destination: RoutingDestination::Headphones,
+                source: RoutingSource::AltSpeaker,
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(error, "Alt Speaker is unavailable for this model");
     }
 }

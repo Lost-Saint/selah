@@ -20,7 +20,7 @@ Selah currently enumerates USB descriptors and filters them by Audient's vendor 
 
 For known devices, discovery also looks for an application-specific (`0xfe`) or vendor-specific (`0xff`) USB interface. A device session may claim one of those interfaces without detaching a kernel driver. Selah intentionally refuses to fall back to an audio-class interface until that behavior can be designed and verified safely.
 
-Control-request execution is limited to speaker and headphone volume: the UI sliders and the opt-in hardware checks send the reference-derived requests below through serialized background tasks. Do not infer support for other controls from the C++ reference compiling or from a device being present in the catalog.
+Implemented controls use pure reference-derived encoders and serialized requests on short-lived background sessions. Routing is enabled only by an explicit per-model capability map; a product ID or output count alone never enables a write.
 
 ### Reference-derived speaker volume
 
@@ -46,13 +46,29 @@ SELAH_HARDWARE_PRODUCT_ID=0008 cargo test --test hardware_session -- --ignored -
 
 Treat this mapping as reference-derived until the audible change is confirmed on headphones. It sets the headphone level; run it only when that is safe for the connected setup. One known limitation from BiD's measurements: on a cue-fed phones output the `0x0c` headphone gain made no audible difference, and the Main-Mix-fed case is untested there — so audibility may also depend on what the phones output is currently routed to, which Selah cannot see yet.
 
-### Reference-derived phones-to-Main-Mix routing
+### Reference-derived output routing
 
-MixiD `set_routing_value` (driver.h) routes one channel with `wValue = chanVals[chan]`, entity `0x33`, and a one-byte destination from `routeToggle[chan]`. Selah encodes phones-to-Main-Mix as the two HP-pair rows in order on one session: `0x0604 → 0x1b` (HP L to Main Mix) and `0x0605 → 0x1c` (HP R to Main Mix), stopping on a first-transfer failure so the pair cannot mismatch silently.
+Routing assigns a source to each physical output; Main Mix, Alt Speaker, Cue A, Cue B, and DAW Mix are sources, not grid coordinates. Entity `0x33`, selector `0x06`, takes one byte per output channel. Selah sends the two halves of a stereo destination in order on one session and stops after the first failed transfer. The current route cannot be read back reliably, so the UI distinguishes the last requested source from a transfer the device accepted and never calls either confirmed hardware state.
 
-The UI button sends both bounded requests through a background task that opens a safe session, sends, and closes the session. This is one-way with no readback and no restore: the status line reports only what was sent. The action is gated to the iD14 MKII (`0x0008`) because MixiD's six-channel table matches that layout and larger ADAT models likely differ; do not widen without per-model hardware evidence.
+There is no known route-off wire value. [MixiD issue #11](https://github.com/TheOnlyJoey/MixiD/issues/11) records that an output is always in one source state. Selah therefore offers **Reset** as the undo action: it sends the documented default for that physical output pair instead of inventing an off code.
 
-Treat this mapping as reference-derived until a listening test confirms the phones are on Main Mix and the existing volume controls become audible. It changes the audible path; run it only when that is safe for the connected setup.
+The iD14-family table comes from MixiD's `routeToggle`. Selah enables it only for the iD14 MKII, whose six-output routing unit and table were subsequently checked on physical hardware by the [BiD reference](https://github.com/baakhoff/BiD/blob/5a60eced59115bad4745aa7416056891252e4173/docs/PROTOCOL.md):
+
+| Output channels | Selah destination | Main | Cue A | Cue B | DAW Mix | Reset |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0,1` | Main speakers / outputs 1–2 | `0x1b,0x1c` | `0x19,0x19` | `0x1a,0x1a` | `0x00,0x01` | Main Mix |
+| `2,3` | Line outputs 3–4 | `0x1b,0x1c` | `0x19,0x19` | `0x1a,0x1a` | `0x02,0x03` | DAW Mix |
+| `4,5` | Headphones | `0x1b,0x1c` | `0x19,0x19` | `0x1a,0x1a` | `0x04,0x05` | Cue A |
+
+The iD14 MKII has no alternate-speaker output, so Selah does not expose the otherwise present MixiD Alt codes. First-generation iD14 writes remain unavailable because the table has not been verified on that named model.
+
+The iD24 mapping comes from BiD's documented listening tests and its official-app decode. Its named source bytes are Main `0x25/0x26`, Alt Speaker `0x27/0x28`, Cue A `0x1e/0x1f`, Cue B `0x20/0x21`, and DAW Mix equal to the zero-based output channel. The evidenced analog destinations use routing-unit channels `0,1`, `2,3`, and `4,5`. Research places an optical pair at non-contiguous routing channels `8,9`, but its reset state is not established, so Selah does not expose that pair as a selectable route.
+
+The iD24's separately evidenced optical-output format request is exposed: entity `0x14`, selector `0x01`, channel zero, with a four-byte little-endian value (`0` = ADAT, `1` = S/PDIF). This is a write-only choice in Selah; its initial mode remains unknown and the UI labels only a requested and accepted transfer. Other models keep this control unavailable until their entity mapping is confirmed.
+
+The iD22 report in [MixiD issue #25](https://github.com/TheOnlyJoey/MixiD/issues/25) also matters on the input side: ADAT 1–8 follow the two onboard inputs as mixer rows 2–9 (zero-based), rather than restarting at row zero. Selah uses that typed ADAT-to-mixer mapping rather than deriving it from output-route indexes. The iD22, iD44 family, and iD48 routing source formulas remain unavailable because existing research does not provide hardware-confirmed values safe enough for writes; their digital-output and insert counts do not imply routing support.
+
+Insert and send/return controls are not implemented. [MixiD issue #5](https://github.com/TheOnlyJoey/MixiD/issues/5) confirms that a mapping still needs capture and verification, so Selah exposes no speculative control.
 
 ### Reference-derived monitor toggles
 

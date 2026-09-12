@@ -5,10 +5,11 @@ use std::time::Duration;
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
 use super::protocol::{
-    ControlRequest, MonitorToggle, channel_polarity, channel_volume, headphone_volume,
-    monitor_toggle, phones_to_main_mix, speaker_volume,
+    ControlRequest, MonitorToggle, channel_polarity, channel_volume, digital_output_mode,
+    headphone_volume, monitor_toggle, output_route, speaker_volume,
 };
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
+use crate::routing::{DigitalOutputMode, InvalidRoute, Route};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xff;
@@ -108,7 +109,7 @@ impl DeviceSession {
         Ok(())
     }
 
-    /// Routes the headphone pair to Main Mix using reference-derived requests.
+    /// Sends one validated source selection to a physical output pair.
     ///
     /// Both channel transfers run in order on this session. A failure stops
     /// the sequence so a partial left/right mismatch is reported instead of
@@ -120,11 +121,26 @@ impl DeviceSession {
     /// # Errors
     ///
     /// Returns an error when a bounded USB transfer fails.
-    pub async fn set_phones_to_main_mix(&mut self) -> Result<(), SessionError> {
-        for request in phones_to_main_mix(self.control_interface().number) {
+    pub async fn set_output_route(&mut self, route: Route) -> Result<(), SessionError> {
+        let requests = output_route(self.model(), route, self.control_interface().number)
+            .map_err(SessionError::InvalidRoute)?;
+        for request in requests {
             self.owner.send(&request).await?;
         }
         Ok(())
+    }
+
+    /// Sets the iD24 optical output to ADAT or S/PDIF framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails.
+    pub async fn set_digital_output_mode(
+        &mut self,
+        mode: DigitalOutputMode,
+    ) -> Result<(), SessionError> {
+        let request = digital_output_mode(mode, self.control_interface().number);
+        self.owner.send(&request).await
     }
 
     /// Sets one monitor toggle using the reference-derived Audient request.
@@ -365,6 +381,7 @@ fn matches_selection(
 /// Failure to establish or close a safe device session.
 #[derive(Clone, Debug)]
 pub enum SessionError {
+    InvalidRoute(InvalidRoute),
     Enumerate(nusb::Error),
     NotFound { product_id: u16 },
     NoSafeControlInterface { product_id: u16 },
@@ -398,7 +415,7 @@ impl SessionError {
             Self::Transfer(nusb::transfer::TransferError::Disconnected) => {
                 SessionErrorKind::Disconnected
             }
-            Self::Transfer(_) => SessionErrorKind::Other,
+            Self::InvalidRoute(_) | Self::Transfer(_) => SessionErrorKind::Other,
         }
     }
 
@@ -433,6 +450,7 @@ fn classify_nusb_error(kind: nusb::ErrorKind) -> SessionErrorKind {
 impl Display for SessionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRoute(source) => Display::fmt(source, formatter),
             Self::Enumerate(source) => write!(formatter, "USB device scan failed: {source}"),
             Self::NotFound { product_id } => {
                 write!(
@@ -470,6 +488,7 @@ impl Error for SessionError {
             | Self::Claim { source, .. }
             | Self::Release { source, .. } => Some(source),
             Self::Transfer(source) => Some(source),
+            Self::InvalidRoute(source) => Some(source),
             Self::NotFound { .. } | Self::NoSafeControlInterface { .. } => None,
         }
     }
