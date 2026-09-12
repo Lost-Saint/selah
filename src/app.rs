@@ -2,10 +2,13 @@ use iced::widget::{button, column, container, row, slider, space, text};
 use iced::{Alignment, Element, Fill, Length, Subscription, Task, Theme};
 
 use crate::device::{
-    DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, UnknownAudientDevice,
-    discover, send_headphone_level, send_phones_to_main_mix, send_speaker_level, watch_events,
+    DetectedDevice, DeviceWatchEvent, DiscoveryError, DiscoveryReport, MonitorToggle,
+    UnknownAudientDevice, discover, send_headphone_level, send_monitor_toggle,
+    send_phones_to_main_mix, send_speaker_level, watch_events,
 };
-use crate::monitor::{VolumeControl, monitor_controls_available};
+use crate::monitor::{
+    ToggleControl, VolumeControl, monitor_controls_available, monitor_toggles_available,
+};
 use crate::routing::{RouteControl, phones_main_mix_available};
 
 struct App {
@@ -16,6 +19,7 @@ struct App {
     speaker: VolumeControl,
     headphone: VolumeControl,
     routing: RouteControl,
+    toggles: [ToggleControl; 5],
 }
 
 /// Outcome of one background speaker-volume send, paired with the level it
@@ -34,6 +38,15 @@ struct HeadphoneVolumeOutcome {
     result: Result<(), String>,
 }
 
+/// Outcome of one background monitor-toggle send, paired with the toggle and
+/// value it attempted so stale completions can be ignored after a rescan.
+#[derive(Clone, Debug)]
+struct MonitorToggleOutcome {
+    toggle: MonitorToggle,
+    on: bool,
+    result: Result<(), String>,
+}
+
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
@@ -45,6 +58,8 @@ enum Message {
     HeadphoneVolumeFinished(HeadphoneVolumeOutcome),
     RoutePhonesToMainMix,
     RoutingFinished(Result<(), String>),
+    MonitorToggleChanged { toggle: MonitorToggle, on: bool },
+    MonitorToggleFinished(MonitorToggleOutcome),
 }
 
 enum DeviceStatus {
@@ -82,10 +97,19 @@ impl App {
                 speaker: VolumeControl::default(),
                 headphone: VolumeControl::default(),
                 routing: RouteControl::default(),
+                toggles: Default::default(),
             },
             Task::none(),
         )
     }
+}
+
+/// Index of a toggle in `App::toggles`, matching `MonitorToggle::ALL` order.
+fn toggle_index(toggle: MonitorToggle) -> usize {
+    MonitorToggle::ALL
+        .iter()
+        .position(|candidate| *candidate == toggle)
+        .expect("every monitor toggle is listed in ALL")
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -112,6 +136,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Ready(report);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.toggles = Default::default();
             app.routing = RouteControl::default();
             finish_scan(app)
         }
@@ -123,6 +148,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Unsupported(report);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.toggles = Default::default();
             app.routing = RouteControl::default();
             finish_scan(app)
         }
@@ -131,6 +157,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Empty;
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.toggles = Default::default();
             app.routing = RouteControl::default();
             finish_scan(app)
         }
@@ -139,6 +166,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Failed(error);
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
+            app.toggles = Default::default();
             app.routing = RouteControl::default();
             finish_scan(app)
         }
@@ -148,6 +176,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::HeadphoneVolumeFinished(outcome) => finish_headphone_volume(app, outcome),
         Message::RoutePhonesToMainMix => request_routing(app),
         Message::RoutingFinished(result) => finish_routing(app, result),
+        Message::MonitorToggleChanged { toggle, on } => request_monitor_toggle(app, toggle, on),
+        Message::MonitorToggleFinished(outcome) => finish_monitor_toggle(app, outcome),
     }
 }
 
@@ -258,6 +288,37 @@ fn finish_routing(app: &mut App, result: Result<(), String>) -> Task<Message> {
     Task::none()
 }
 
+/// Starts a monitor-toggle send; ignored while that toggle has one in flight.
+///
+/// The USB work runs in the returned task, away from Iced's UI thread.
+fn request_monitor_toggle(app: &mut App, toggle: MonitorToggle, on: bool) -> Task<Message> {
+    let Some(device) = selected_device(app) else {
+        return Task::none();
+    };
+
+    match app.toggles[toggle_index(toggle)].request(on) {
+        Some(send) => monitor_toggle_task(device, toggle, send),
+        None => Task::none(),
+    }
+}
+
+/// Records a toggle send result; stale completions after a rescan are ignored.
+fn finish_monitor_toggle(app: &mut App, outcome: MonitorToggleOutcome) -> Task<Message> {
+    let MonitorToggleOutcome { toggle, on, result } = outcome;
+    let control = &mut app.toggles[toggle_index(toggle)];
+    if !control.is_in_flight(on) {
+        return Task::none();
+    }
+
+    match &result {
+        Ok(()) => tracing::info!(?toggle, on, "Monitor toggle sent"),
+        Err(error) => tracing::warn!(?toggle, on, %error, "Monitor toggle send failed"),
+    }
+
+    let _ = control.finish(on, result);
+    Task::none()
+}
+
 /// The first supported device, matching what `supported_view` displays.
 fn selected_device(app: &App) -> Option<DetectedDevice> {
     match &app.status {
@@ -294,6 +355,19 @@ fn routing_task(device: DetectedDevice) -> Task<Message> {
     Task::perform(
         async move { send_phones_to_main_mix(device).await },
         Message::RoutingFinished,
+    )
+}
+
+fn monitor_toggle_task(device: DetectedDevice, toggle: MonitorToggle, on: bool) -> Task<Message> {
+    Task::perform(
+        async move {
+            MonitorToggleOutcome {
+                toggle,
+                on,
+                result: send_monitor_toggle(device, toggle, on).await,
+            }
+        },
+        Message::MonitorToggleFinished,
     )
 }
 
@@ -366,7 +440,8 @@ fn view(app: &App) -> Element<'_, Message> {
             &app.status,
             &app.speaker,
             &app.headphone,
-            &app.routing
+            &app.routing,
+            &app.toggles
         ))
             .width(Fill)
             .padding(28)
@@ -398,6 +473,7 @@ fn status_view<'a>(
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
     routing: &'a RouteControl,
+    toggles: &'a [ToggleControl; 5],
 ) -> Element<'a, Message> {
     match status {
         DeviceStatus::Scanning => column![
@@ -418,7 +494,7 @@ fn status_view<'a>(
         ]
         .spacing(14)
         .into(),
-        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone, routing),
+        DeviceStatus::Ready(report) => supported_view(report, speaker, headphone, routing, toggles),
         DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
@@ -436,6 +512,7 @@ fn supported_view<'a>(
     speaker: &'a VolumeControl,
     headphone: &'a VolumeControl,
     routing: &'a RouteControl,
+    toggles: &'a [ToggleControl; 5],
 ) -> Element<'a, Message> {
     let device = &report.supported[0];
     let model = device.model;
@@ -489,6 +566,12 @@ fn supported_view<'a>(
         content = content.push(routing_button(routing));
     }
 
+    // Monitor toggles share the same gate: the `0x36` toggle table is
+    // verified against the iD14 MKII layout so far.
+    if monitor_toggles_available(device) {
+        content = content.push(monitor_toggles_view(toggles));
+    }
+
     if let Some(extra) = extra {
         content = content.push(text(extra).size(13).style(text::secondary));
     }
@@ -529,6 +612,45 @@ fn routing_button(routing: &RouteControl) -> Element<'_, Message> {
         text(routing.status_text()).size(13).style(text::secondary),
     ]
     .spacing(8)
+    .into()
+}
+
+/// Monitor toggles without implying confirmed device state.
+///
+/// Each button shows the last requested on/off value; the status line
+/// reports what was sent — never what the device is confirmed to hold.
+/// Buttons are real Iced buttons, so they stay keyboard-focusable.
+fn monitor_toggles_view(toggles: &[ToggleControl; 5]) -> Element<'_, Message> {
+    let mut section = column![text("Monitor").size(16)].spacing(8);
+    for toggle in MonitorToggle::ALL {
+        section = section.push(monitor_toggle_button(
+            toggle,
+            &toggles[toggle_index(toggle)],
+        ));
+    }
+    section.into()
+}
+
+fn monitor_toggle_button(toggle: MonitorToggle, control: &ToggleControl) -> Element<'_, Message> {
+    use crate::monitor::ToggleStatus;
+
+    let sending = matches!(control.status(), ToggleStatus::Sending { .. });
+    let pressed_label = if control.position() { "ON" } else { "OFF" };
+    column![
+        row![
+            text(toggle.label()).size(14),
+            space().width(Length::Fill),
+            button(text(pressed_label))
+                .padding([4, 14])
+                .on_press_maybe((!sending).then_some(Message::MonitorToggleChanged {
+                    toggle,
+                    on: !control.position(),
+                })),
+        ]
+        .align_y(Alignment::Center),
+        text(control.status_text()).size(13).style(text::secondary),
+    ]
+    .spacing(4)
     .into()
 }
 
@@ -583,13 +705,14 @@ fn additional_devices(report: &DiscoveryReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DeviceStatus, HeadphoneVolumeOutcome, Message, SpeakerVolumeOutcome, finish_scan,
-        request_scan, update,
+        App, DeviceStatus, HeadphoneVolumeOutcome, Message, MonitorToggleOutcome,
+        SpeakerVolumeOutcome, finish_scan, request_scan, toggle_index, update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
+        MonitorToggle,
     };
-    use crate::monitor::VolumeStatus;
+    use crate::monitor::{ToggleStatus, VolumeStatus};
 
     #[test]
     fn scan_requests_are_coalesced_while_a_scan_is_running() {
@@ -968,6 +1091,215 @@ mod tests {
 
         assert!(matches!(app.status, DeviceStatus::Empty));
         assert_eq!(app.routing.status(), RouteStatus::Unknown);
+    }
+
+    #[test]
+    fn monitor_toggle_request_without_a_device_is_ignored() {
+        let (mut app, _startup) = App::new();
+
+        let _ignored = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: true,
+            },
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn monitor_toggle_moves_from_unknown_through_sending_to_sent() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: true,
+            },
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sending { sending: true }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Dim,
+                on: true,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sent { on: true }
+        );
+    }
+
+    #[test]
+    fn monitor_toggle_failure_keeps_last_sent_and_reports_the_error() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _first = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Mono,
+                on: true,
+            },
+        );
+        let _applied = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Mono,
+                on: true,
+                result: Ok(()),
+            }),
+        );
+
+        let _retry = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Mono,
+                on: false,
+            },
+        );
+        let _failed = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Mono,
+                on: false,
+                result: Err("no device".to_owned()),
+            }),
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Mono)].status(),
+            ToggleStatus::Failed {
+                error: "no device".to_owned(),
+                last_sent: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn monitor_toggle_request_while_sending_is_ignored() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _first = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: true,
+            },
+        );
+        let _second = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: false,
+            },
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sending { sending: true }
+        );
+
+        let _done = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Dim,
+                on: true,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sent { on: true }
+        );
+    }
+
+    #[test]
+    fn monitor_toggles_track_independently() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _dim = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: true,
+            },
+        );
+        let _mono = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Mono,
+                on: true,
+            },
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sending { sending: true }
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Mono)].status(),
+            ToggleStatus::Sending { sending: true }
+        );
+
+        let _dim_done = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Dim,
+                on: true,
+                result: Ok(()),
+            }),
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Sent { on: true }
+        );
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Mono)].status(),
+            ToggleStatus::Sending { sending: true }
+        );
+    }
+
+    #[test]
+    fn stale_monitor_toggle_completion_after_a_rescan_is_ignored() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+
+        let _send = update(
+            &mut app,
+            Message::MonitorToggleChanged {
+                toggle: MonitorToggle::Dim,
+                on: true,
+            },
+        );
+        let _rescan = update(
+            &mut app,
+            Message::DiscoveryFinished(Ok(DiscoveryReport::default())),
+        );
+        let _stale = update(
+            &mut app,
+            Message::MonitorToggleFinished(MonitorToggleOutcome {
+                toggle: MonitorToggle::Dim,
+                on: true,
+                result: Ok(()),
+            }),
+        );
+
+        assert!(matches!(app.status, DeviceStatus::Empty));
+        assert_eq!(
+            app.toggles[toggle_index(MonitorToggle::Dim)].status(),
+            ToggleStatus::Unknown
+        );
     }
 
     fn assert_level_eq(actual: f32, expected: f32) {

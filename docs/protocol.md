@@ -54,6 +54,14 @@ The UI button sends both bounded requests through a background task that opens a
 
 Treat this mapping as reference-derived until a listening test confirms the phones are on Main Mix and the existing volume controls become audible. It changes the audible path; run it only when that is safe for the connected setup.
 
+### Reference-derived monitor toggles
+
+MixiD `set_bool_state` (driver.h) flips one monitor bool with `wValue = masterVals[mode]`, entity `0x36`, and a one-byte payload. Selah encodes the five panel toggles the same way: Dim `0x0500`, Alt-speaker `0x0c00`, Talkback `0x0700`, Mono `0x0000`, and Speaker Mute `0x0400`. Each send opens a safe session, transfers one bounded request, and closes the session.
+
+`MixiD` keeps the on/off values in a local dummy array, so Selah must do the same honesty work as volumes and routing: each button shows the last requested on/off value, and the status line reports only what was sent, never confirmed device state. The strip is gated to the iD14 MKII (`0x0008`); do not widen without per-model hardware evidence.
+
+Treat these mappings as reference-derived until each toggle is confirmed audibly on hardware. They change the monitor path; run them only when that is safe for the connected setup.
+
 ## Hardware verification
 
 | Date | Model | USB identity | Verification | Result |

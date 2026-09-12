@@ -20,6 +20,11 @@ const HEADPHONE_OUTPUT_ENTITY: u16 = 0x0c00;
 const ROUTING_ENTITY: u16 = 0x3300;
 const PHONES_ROUTE_CONTROLS: [u16; 2] = [0x0604, 0x0605];
 const MAIN_MIX_ROUTES: [u8; 2] = [0x1b, 0x1c];
+// Monitor toggles live on the monitor entity `0x36`: `MixiD`
+// `set_bool_state` (driver.h) writes a one-byte bool with
+// `wValue = masterVals[mode]`. `MixiD` keeps the on/off state in a local
+// dummy array, so Selah must present the result as sent, never confirmed.
+const MONITOR_TOGGLE_ENTITY: u16 = 0x3600;
 
 /// A finite mixer level between silence (`0.0`) and full scale (`1.0`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +100,66 @@ pub(crate) fn headphone_volume(
     })
 }
 
+/// A monitor toggle on the `0x36` entity, after `MixiD` `masterVals`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MonitorToggle {
+    Dim,
+    AltSpeaker,
+    Talkback,
+    Mono,
+    SpeakerMute,
+}
+
+impl MonitorToggle {
+    /// All toggles in stable UI order.
+    pub const ALL: [Self; 5] = [
+        Self::Dim,
+        Self::AltSpeaker,
+        Self::Talkback,
+        Self::Mono,
+        Self::SpeakerMute,
+    ];
+
+    /// Short label for buttons, matching the reference panel.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dim => "DIM",
+            Self::AltSpeaker => "ALT",
+            Self::Talkback => "TB",
+            Self::Mono => "MONO",
+            Self::SpeakerMute => "MUTE",
+        }
+    }
+
+    fn control(self) -> u16 {
+        match self {
+            Self::Dim => 0x0500,
+            Self::AltSpeaker => 0x0c00,
+            Self::Talkback => 0x0700,
+            Self::Mono => 0x0000,
+            Self::SpeakerMute => 0x0400,
+        }
+    }
+}
+
+/// Encodes one monitor toggle as the one-byte bool request `MixiD` sends.
+///
+/// This is one-way: `MixiD` flips a local dummy bool with no readback, so
+/// callers must present the result as sent, never confirmed.
+pub(crate) fn monitor_toggle(
+    toggle: MonitorToggle,
+    on: bool,
+    interface_number: u8,
+) -> ControlRequest {
+    ControlRequest {
+        request: SET_CURRENT,
+        value: toggle.control(),
+        index: MONITOR_TOGGLE_ENTITY | u16::from(interface_number),
+        payload: vec![u8::from(on)],
+    }
+}
+
 /// Encodes routing the headphone pair to Main Mix as two channel requests.
 ///
 /// `MixiD` `routeToggle` rows 4 and 5 (HP L/R) select Main Mix with values
@@ -112,7 +177,8 @@ pub(crate) fn phones_to_main_mix(interface_number: u8) -> [ControlRequest; 2] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRequest, NormalizedLevel, headphone_volume, phones_to_main_mix, speaker_volume,
+        ControlRequest, MonitorToggle, NormalizedLevel, headphone_volume, monitor_toggle,
+        phones_to_main_mix, speaker_volume,
     };
 
     #[test]
@@ -189,5 +255,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn encodes_reference_monitor_toggles() {
+        let cases = [
+            (MonitorToggle::Dim, 0x0500),
+            (MonitorToggle::AltSpeaker, 0x0c00),
+            (MonitorToggle::Talkback, 0x0700),
+            (MonitorToggle::Mono, 0x0000),
+            (MonitorToggle::SpeakerMute, 0x0400),
+        ];
+        for (toggle, value) in cases {
+            assert_eq!(
+                monitor_toggle(toggle, true, 4),
+                ControlRequest {
+                    request: 0x01,
+                    value,
+                    index: 0x3604,
+                    payload: vec![0x01],
+                }
+            );
+            assert_eq!(monitor_toggle(toggle, false, 4).payload, vec![0x00]);
+        }
+    }
+
+    #[test]
+    fn monitor_toggle_labels_match_the_reference_panel() {
+        let labels = MonitorToggle::ALL.map(MonitorToggle::label);
+        assert_eq!(labels, ["DIM", "ALT", "TB", "MONO", "MUTE"]);
     }
 }

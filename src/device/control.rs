@@ -7,7 +7,7 @@
 //! with a recovery hint at this boundary; typed [`SessionError`] distinctions
 //! stay inside the transport.
 
-use super::{DetectedDevice, DeviceSession, NormalizedLevel, SessionError};
+use super::{DetectedDevice, DeviceSession, MonitorToggle, NormalizedLevel, SessionError};
 
 /// Sends one bounded speaker volume request and always closes the session.
 ///
@@ -45,6 +45,25 @@ pub async fn send_headphone_level(device: DetectedDevice, level: f32) -> Result<
 pub async fn send_phones_to_main_mix(device: DetectedDevice) -> Result<(), String> {
     let mut session = open_session(&device).await?;
     let send = session.set_phones_to_main_mix().await;
+    close_after_send(session, send).await
+}
+
+/// Sends one monitor toggle request and always closes the session.
+///
+/// This is one-way with no readback; callers must present the result as
+/// sent, never confirmed.
+///
+/// # Errors
+///
+/// Returns a message with a recovery hint when opening, sending, or closing
+/// fails.
+pub async fn send_monitor_toggle(
+    device: DetectedDevice,
+    toggle: MonitorToggle,
+    on: bool,
+) -> Result<(), String> {
+    let mut session = open_session(&device).await?;
+    let send = session.set_monitor_toggle(toggle, on).await;
     close_after_send(session, send).await
 }
 

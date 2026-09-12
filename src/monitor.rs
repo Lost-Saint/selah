@@ -194,9 +194,141 @@ pub fn monitor_controls_available(device: &DetectedDevice) -> bool {
     device.control_interface.is_some()
 }
 
+/// Send state for one monitor toggle (dim, mute, mono, alt, talkback).
+///
+/// Like volumes and routing, Selah cannot read toggles back: `position` is
+/// only the last requested on/off value, never confirmed device state.
+#[derive(Clone, Debug, Default)]
+pub struct ToggleControl {
+    position: bool,
+    in_flight: Option<bool>,
+    last_sent: Option<bool>,
+    last_error: Option<String>,
+}
+
+/// The honest, nameable state of one monitor toggle.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ToggleStatus {
+    /// Nothing has been sent yet; the device state is unknown.
+    Unknown,
+    /// A send is running.
+    Sending { sending: bool },
+    /// The last send failed; the error stays visible until the next request.
+    /// `last_sent` is the most recent acknowledged value, preserved so a
+    /// failure is never presented as the device's state.
+    Failed {
+        error: String,
+        last_sent: Option<bool>,
+    },
+    /// The last send was acknowledged; still not read back from the device.
+    Sent { on: bool },
+}
+
+impl ToggleControl {
+    /// Returns the last requested value, not device state.
+    #[must_use]
+    pub fn position(&self) -> bool {
+        self.position
+    }
+
+    /// Names the current honest state of this control.
+    #[must_use]
+    pub fn status(&self) -> ToggleStatus {
+        match (self.in_flight, &self.last_error, self.last_sent) {
+            (Some(sending), _, _) => ToggleStatus::Sending { sending },
+            (None, Some(error), _) => ToggleStatus::Failed {
+                error: error.clone(),
+                last_sent: self.last_sent,
+            },
+            (None, None, Some(on)) => ToggleStatus::Sent { on },
+            (None, None, None) => ToggleStatus::Unknown,
+        }
+    }
+
+    /// Describes the current state without implying confirmed device state.
+    #[must_use]
+    pub fn status_text(&self) -> String {
+        match self.status() {
+            ToggleStatus::Sending { sending } => {
+                format!("Sending {}…", if sending { "on" } else { "off" })
+            }
+            ToggleStatus::Failed { error, .. } => {
+                format!("Send failed: {error} Press again to retry.")
+            }
+            ToggleStatus::Sent { on } => {
+                format!(
+                    "Last sent {} — not read back from the device.",
+                    if on { "on" } else { "off" }
+                )
+            }
+            ToggleStatus::Unknown => {
+                "No value read from the device — pressing sends a new value.".to_owned()
+            }
+        }
+    }
+
+    /// Records a user-requested value.
+    ///
+    /// Returns the value to send immediately, or `None` when a send is
+    /// already in flight (the button is disabled while sending).
+    #[must_use]
+    pub fn request(&mut self, on: bool) -> Option<bool> {
+        self.position = on;
+        self.last_error = None;
+
+        if self.in_flight.is_some() {
+            return None;
+        }
+
+        self.in_flight = Some(on);
+        Some(on)
+    }
+
+    /// Whether this completion belongs to the current send.
+    #[must_use]
+    pub fn is_in_flight(&self, on: bool) -> bool {
+        self.in_flight == Some(on)
+    }
+
+    /// Records a background send result. Stale completions leave the state
+    /// untouched.
+    #[must_use]
+    pub fn finish(&mut self, on: bool, result: Result<(), String>) -> bool {
+        if self.in_flight != Some(on) {
+            return false;
+        }
+
+        match result {
+            Ok(()) => {
+                self.last_sent = Some(on);
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+            }
+        }
+
+        self.in_flight = None;
+        true
+    }
+}
+
+/// Whether the monitor toggles can be offered for this attachment.
+///
+/// Gated to the iD14 MKII (`0x0008`): `MixiD`'s toggle table is verified
+/// against that layout in Selah so far, and per-model differences are
+/// unverified. Do not widen without hardware evidence.
+#[must_use]
+pub fn monitor_toggles_available(device: &DetectedDevice) -> bool {
+    device.control_interface.is_some() && device.model.product_id == 0x0008
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{VolumeControl, VolumeStatus, monitor_controls_available};
+    use super::{
+        ToggleControl, ToggleStatus, VolumeControl, VolumeStatus, monitor_controls_available,
+        monitor_toggles_available,
+    };
     use crate::device::{ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation};
 
     #[test]
@@ -374,6 +506,95 @@ mod tests {
     fn availability_follows_the_safe_control_interface() {
         assert!(monitor_controls_available(&device_with_control(true)));
         assert!(!monitor_controls_available(&device_with_control(false)));
+    }
+
+    #[test]
+    fn toggle_moves_from_unknown_through_sending_to_sent() {
+        let mut control = ToggleControl::default();
+        assert_eq!(control.status(), ToggleStatus::Unknown);
+
+        assert_eq!(control.request(true), Some(true));
+        assert!(control.position());
+        assert_eq!(control.status(), ToggleStatus::Sending { sending: true });
+
+        assert!(control.finish(true, Ok(())));
+        assert_eq!(control.status(), ToggleStatus::Sent { on: true });
+        assert!(
+            control
+                .status_text()
+                .contains("not read back from the device")
+        );
+    }
+
+    #[test]
+    fn toggle_failure_keeps_last_sent_and_reports_the_error() {
+        let mut control = ToggleControl::default();
+        let _send = control.request(true);
+        assert!(control.finish(true, Ok(())));
+
+        assert_eq!(control.request(false), Some(false));
+        assert!(control.finish(false, Err("no device".to_owned())));
+        assert!(!control.position());
+        assert_eq!(
+            control.status(),
+            ToggleStatus::Failed {
+                error: "no device".to_owned(),
+                last_sent: Some(true),
+            }
+        );
+        assert!(control.status_text().contains("no device"));
+    }
+
+    #[test]
+    fn toggle_request_while_sending_is_ignored() {
+        let mut control = ToggleControl::default();
+        assert_eq!(control.request(true), Some(true));
+        assert_eq!(control.request(false), None);
+        assert_eq!(control.status(), ToggleStatus::Sending { sending: true });
+
+        assert!(control.finish(true, Ok(())));
+        assert_eq!(control.status(), ToggleStatus::Sent { on: true });
+    }
+
+    #[test]
+    fn toggle_stale_completions_leave_state_untouched() {
+        let mut control = ToggleControl::default();
+        let _send = control.request(true);
+
+        assert!(!control.finish(false, Ok(())));
+        assert!(control.is_in_flight(true));
+        assert_eq!(control.status(), ToggleStatus::Sending { sending: true });
+    }
+
+    #[test]
+    fn toggle_availability_requires_id14_mkii_with_a_control_interface() {
+        assert!(monitor_toggles_available(&device_with_product(
+            0x0008, true
+        )));
+        assert!(!monitor_toggles_available(&device_with_product(
+            0x0008, false
+        )));
+        assert!(!monitor_toggles_available(&device_with_product(
+            0x0002, true
+        )));
+        assert!(!monitor_toggles_available(&device_with_product(
+            0x000d, true
+        )));
+    }
+
+    fn device_with_product(product_id: u16, has_control: bool) -> DetectedDevice {
+        DetectedDevice {
+            location: DeviceLocation {
+                bus: "1".to_owned(),
+                address: 2,
+            },
+            model: crate::device::supported_device(product_id).unwrap(),
+            reported_name: None,
+            control_interface: has_control.then_some(ControlInterface {
+                number: 4,
+                kind: ControlInterfaceKind::ApplicationSpecific,
+            }),
+        }
     }
 
     fn assert_level_eq(actual: f32, expected: f32) {

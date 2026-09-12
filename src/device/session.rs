@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
-use super::protocol::{ControlRequest, headphone_volume, phones_to_main_mix, speaker_volume};
+use super::protocol::{
+    ControlRequest, MonitorToggle, headphone_volume, monitor_toggle, phones_to_main_mix,
+    speaker_volume,
+};
 use super::{AUDIENT_VENDOR_ID, DetectedDevice, DeviceLocation, DeviceModel, NormalizedLevel};
 
 const USB_CLASS_APPLICATION_SPECIFIC: u8 = 0xfe;
@@ -122,6 +125,23 @@ impl DeviceSession {
             self.owner.send(&request).await?;
         }
         Ok(())
+    }
+
+    /// Sets one monitor toggle using the reference-derived Audient request.
+    ///
+    /// Calls require mutable access so only one device transfer can be in
+    /// flight for a session at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded USB transfer fails.
+    pub async fn set_monitor_toggle(
+        &mut self,
+        toggle: MonitorToggle,
+        on: bool,
+    ) -> Result<(), SessionError> {
+        let request = monitor_toggle(toggle, on, self.control_interface().number);
+        self.owner.send(&request).await
     }
 
     /// Releases the control interface and closes the session.
