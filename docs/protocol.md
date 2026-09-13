@@ -117,3 +117,5 @@ One caution carried over from BiD (issue #26): control traffic while the firmwar
 | 2026-09-13 | iD14 MKII | `2708:0008`, device release `0x0112` | Re-ran `opens_and_closes_selected_safe_interface`, `reads_monitor_volume_harmlessly`, `probes_meter_block_harmlessly` on current tree (no writes except the session claim) | Passed 3/3; control interface 4 (`0xfe` app-specific) claimed and released, audio interfaces 0–2 stayed bound to `snd-usb-audio`, PipeWire kept exposing the iD14 |
 
 The device release comes from the USB descriptor and is not confirmed to be the user-facing firmware version.
+
+The maintained per-model matrix lives in [`support.md`](support.md).
