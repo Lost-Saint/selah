@@ -1,6 +1,8 @@
 //! Audient device identification and, eventually, USB communication.
 
 mod catalog;
+mod support;
+pub use support::{SupportLevel, support_label, support_level};
 mod control;
 mod discovery;
 mod error;
