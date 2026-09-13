@@ -5,6 +5,7 @@ pub mod device;
 mod mixer;
 mod monitor;
 mod routing;
+mod ui;
 
 /// Starts the Selah desktop application.
 ///
