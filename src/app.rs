@@ -7,7 +7,8 @@ use crate::device::{
     DetectedDevice, DeviceLocation, DeviceWatchEvent, DiscoveryError, DiscoveryReport,
     FeedbackSnapshot, MonitorToggle, UnknownAudientDevice, discover, read_feedback,
     send_channel_level, send_channel_polarity, send_digital_output_mode, send_headphone_level,
-    send_monitor_toggle, send_output_route, send_speaker_level, watch_events,
+    send_monitor_toggle, send_output_route, send_speaker_level, support_label, support_level,
+    watch_events,
 };
 use crate::mixer::{
     ChannelStrip, channel_name, meter_feedback_available, mixer_available, mixer_channel_count,
@@ -22,7 +23,7 @@ use crate::routing::{
 };
 
 mod route_state;
-use route_state::fresh_routes;
+use route_state::fresh_routes_for;
 
 /// Meter polls run at 10 Hz: the slowest rate that still reads as motion.
 /// Monitor state rides the same timer at ~1 Hz (see [`monitor_due`]).
@@ -31,6 +32,7 @@ const MONITOR_CADENCE_MS: u64 = 1_000;
 
 struct App {
     status: DeviceStatus,
+    selected: Option<DeviceLocation>,
     scan_in_flight: bool,
     rescan_requested: bool,
     watch_status: WatchStatus,
@@ -124,6 +126,7 @@ struct FeedbackOutcome {
 #[derive(Clone, Debug)]
 enum Message {
     Refresh,
+    DeviceSelected(DeviceLocation),
     DeviceWatch(DeviceWatchEvent),
     DiscoveryFinished(Result<DiscoveryReport, DiscoveryError>),
     SpeakerVolumeChanged(f32),
@@ -174,6 +177,7 @@ impl App {
         (
             Self {
                 status: DeviceStatus::Scanning,
+                selected: None,
                 scan_in_flight: false,
                 rescan_requested: false,
                 watch_status: WatchStatus::Starting,
@@ -201,8 +205,37 @@ fn toggle_index(toggle: MonitorToggle) -> usize {
         .expect("every monitor toggle is listed in ALL")
 }
 
+/// Drops per-device state for a new or rescanned selection, then schedules
+/// one hardware refresh. Shared by explicit picks and discovery completions
+/// so both rebuild routes, channels, and meters for the same device.
+fn adopt_selection(app: &mut App) -> Task<Message> {
+    let selected = selected_device(app);
+    app.speaker = VolumeControl::default();
+    app.headphone = VolumeControl::default();
+    app.toggles = Default::default();
+    app.routes = selected.as_ref().map(fresh_routes_for).unwrap_or_default();
+    app.digital_output_mode = ToggleControl::default();
+    app.channels = selected
+        .as_ref()
+        .map(fresh_channels_for)
+        .unwrap_or_default();
+    // A (re)connected device starts unknown: old local values are
+    // never restored as confirmed, and the refresh below adopts
+    // whatever the hardware actually reports.
+    app.meters = selected.as_ref().map(fresh_meters_for).unwrap_or_default();
+    app.feedback_notice = None;
+    app.feedback_in_flight = false;
+    app.feedback_tick = 0;
+    let scan = finish_scan(app);
+    Task::batch([scan, refresh_task(app, true)])
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
+        Message::DeviceSelected(location) => {
+            app.selected = Some(location);
+            adopt_selection(app)
+        }
         Message::DeviceWatch(event) => device_watch_event(app, event),
         Message::Refresh => request_scan(app),
         Message::DiscoveryFinished(Ok(report)) if !report.supported.is_empty() => {
@@ -211,22 +244,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 unsupported = report.unsupported.len(),
                 "Audient device scan completed"
             );
+            let still_there = app
+                .selected
+                .as_ref()
+                .is_some_and(|wanted| report.supported.iter().any(|d| &d.location == wanted));
+            if !still_there {
+                app.selected = None;
+            }
             app.status = DeviceStatus::Ready(report);
-            app.speaker = VolumeControl::default();
-            app.headphone = VolumeControl::default();
-            app.toggles = Default::default();
-            app.routes = fresh_routes(&app.status);
-            app.digital_output_mode = ToggleControl::default();
-            app.channels = fresh_channels(&app.status);
-            // A (re)connected device starts unknown: old local values are
-            // never restored as confirmed, and the refresh below adopts
-            // whatever the hardware actually reports.
-            app.meters = fresh_meters(&app.status);
-            app.feedback_notice = None;
-            app.feedback_in_flight = false;
-            app.feedback_tick = 0;
-            let scan = finish_scan(app);
-            Task::batch([scan, refresh_task(app, true)])
+            adopt_selection(app)
         }
         Message::DiscoveryFinished(Ok(report)) if !report.unsupported.is_empty() => {
             tracing::warn!(
@@ -234,6 +260,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 "Found an unrecognized Audient interface"
             );
             app.status = DeviceStatus::Unsupported(report);
+            app.selected = None;
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
@@ -248,6 +275,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DiscoveryFinished(Ok(_)) => {
             tracing::info!("No Audient interface detected");
             app.status = DeviceStatus::Empty;
+            app.selected = None;
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
@@ -262,6 +290,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DiscoveryFinished(Err(error)) => {
             tracing::error!(%error, "Audient device scan failed");
             app.status = DeviceStatus::Failed(error);
+            app.selected = None;
             app.speaker = VolumeControl::default();
             app.headphone = VolumeControl::default();
             app.toggles = Default::default();
@@ -317,29 +346,19 @@ fn device_watch_event(app: &mut App, event: DeviceWatchEvent) -> Task<Message> {
     }
 }
 
-/// Builds a fresh strip per input of the newly discovered model.
-fn fresh_channels(status: &DeviceStatus) -> Vec<ChannelStrip> {
-    match status {
-        DeviceStatus::Ready(report) => {
-            let count = mixer_channel_count(report.supported[0].model) as usize;
-            std::iter::repeat_with(ChannelStrip::default)
-                .take(count)
-                .collect()
-        }
-        _ => Vec::new(),
-    }
+/// Builds a fresh strip per input of one explicitly selected device.
+fn fresh_channels_for(device: &DetectedDevice) -> Vec<ChannelStrip> {
+    let count = mixer_channel_count(device.model) as usize;
+    std::iter::repeat_with(ChannelStrip::default)
+        .take(count)
+        .collect()
 }
 
-/// Builds one unknown meter slot per mixer input. Meters start unknown and
-/// only show values a whole device block actually delivered.
-fn fresh_meters(status: &DeviceStatus) -> Vec<Option<u8>> {
-    match status {
-        DeviceStatus::Ready(report) => {
-            let count = mixer_channel_count(report.supported[0].model) as usize;
-            std::iter::repeat_with(|| None).take(count).collect()
-        }
-        _ => Vec::new(),
-    }
+/// Builds one unknown meter slot per mixer input of one explicitly
+/// selected device.
+fn fresh_meters_for(device: &DetectedDevice) -> Vec<Option<u8>> {
+    let count = mixer_channel_count(device.model) as usize;
+    std::iter::repeat_with(|| None).take(count).collect()
 }
 
 /// How often the device may be polled, or `None` when no feedback is
@@ -788,10 +807,17 @@ fn finish_channel_polarity(app: &mut App, outcome: ChannelPolarityOutcome) -> Ta
     Task::none()
 }
 
-/// The first supported device, matching what `supported_view` displays.
+/// The explicitly picked device, else the first supported one.
 fn selected_device(app: &App) -> Option<DetectedDevice> {
     match &app.status {
-        DeviceStatus::Ready(report) => report.supported.first().cloned(),
+        DeviceStatus::Ready(report) => {
+            if let Some(wanted) = app.selected.as_ref()
+                && let Some(hit) = report.supported.iter().find(|d| &d.location == wanted)
+            {
+                return Some(hit.clone());
+            }
+            report.supported.first().cloned()
+        }
         _ => None,
     }
 }
@@ -1036,11 +1062,31 @@ fn status_view(app: &App) -> Element<'_, Message> {
     }
 }
 
-fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, Message> {
-    let device = &report.supported[0];
-    let model = device.model;
-    let extra = additional_devices(report);
-    let session_readiness = match device.control_interface {
+/// One button per supported attachment; the current pick has no action.
+/// Two identical models stay distinguishable through their USB location.
+fn device_picker<'a>(
+    report: &'a DiscoveryReport,
+    current: &DeviceLocation,
+) -> Element<'a, Message> {
+    let mut picker = row![text("Interface:").size(13)]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    for candidate in &report.supported {
+        let label = format!(
+            "{} @ {}:{}",
+            candidate.model.name, candidate.location.bus, candidate.location.address
+        );
+        let is_current = candidate.location == *current;
+        picker = picker.push(button(text(label).size(13)).on_press_maybe(
+            (!is_current).then_some(Message::DeviceSelected(candidate.location.clone())),
+        ));
+    }
+    picker.into()
+}
+
+/// One line on whether Selah may claim a safe control interface for sends.
+fn control_readiness(device: &DetectedDevice) -> String {
+    match device.control_interface {
         Some(control) => format!(
             "Safe control interface {} available ({})",
             control.number, control.kind
@@ -1048,7 +1094,24 @@ fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, 
         None => {
             "No safe control interface found; Selah will not claim the audio interface.".to_owned()
         }
-    };
+    }
+}
+
+fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, Message> {
+    // The explicitly picked attachment, else the first one. Resolved as a
+    // borrow from the report so the picker below can reference it.
+    let picked = selected_device(app).map(|selected| selected.location);
+    let device: &DetectedDevice = picked
+        .as_ref()
+        .and_then(|wanted| {
+            report
+                .supported
+                .iter()
+                .find(|candidate| &candidate.location == wanted)
+        })
+        .unwrap_or(&report.supported[0]);
+    let model = device.model;
+    let session_readiness = control_readiness(device);
 
     let mut content = column![
         status_label("Detected", container::success),
@@ -1059,6 +1122,13 @@ fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, 
         text(session_readiness).size(14),
     ]
     .spacing(14);
+
+    if report.supported.len() > 1 {
+        content = content.push(device_picker(report, &device.location));
+    }
+
+    let support = support_label(support_level(model));
+    content = content.push(text(support).size(13).style(text::secondary));
 
     if let Some(notice) = app.feedback_notice.as_deref() {
         content = content.push(
@@ -1143,10 +1213,6 @@ fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, 
     // control for them is shown.
     if mixer_available(device) {
         content = content.push(mixer_view(device.model, &app.channels, &app.meters));
-    }
-
-    if let Some(extra) = extra {
-        content = content.push(text(extra).size(13).style(text::secondary));
     }
 
     content.into()
@@ -1458,23 +1524,14 @@ fn detail_row(label: &'static str, value: u8) -> Element<'static, Message> {
     .into()
 }
 
-fn additional_devices(report: &DiscoveryReport) -> Option<String> {
-    let additional = report.supported.len().saturating_sub(1) + report.unsupported.len();
-
-    match additional {
-        0 => None,
-        1 => Some("1 additional Audient interface was found.".to_owned()),
-        count => Some(format!("{count} additional Audient interfaces were found.")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         App, ChannelLevelOutcome, ChannelPolarityOutcome, DeviceStatus, DigitalOutputModeOutcome,
         FeedbackOutcome, METER_CADENCE_MS, MONITOR_CADENCE_MS, Message, MonitorToggleOutcome,
-        RoutingOutcome, SpeakerVolumeOutcome, feedback_cadence_ms, finish_scan, fresh_meters,
-        fresh_routes, monitor_due, request_scan, route_control, toggle_index, update,
+        RoutingOutcome, SpeakerVolumeOutcome, feedback_cadence_ms, finish_scan, fresh_meters_for,
+        fresh_routes_for, monitor_due, request_scan, route_control, selected_device, toggle_index,
+        update,
     };
     use crate::device::{
         ControlInterface, ControlInterfaceKind, DetectedDevice, DeviceLocation, DiscoveryReport,
@@ -1621,7 +1678,7 @@ mod tests {
     fn routing_moves_from_unknown_through_sending_to_sent() {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
-        app.routes = fresh_routes(&app.status);
+        app.routes = fresh_routes_for(&selected_device(&app).unwrap());
         let route = headphone_route(RoutingSource::MainMix);
 
         let _send = update(&mut app, Message::RouteSelected(route));
@@ -1657,7 +1714,7 @@ mod tests {
     fn routing_failure_reports_the_error() {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
-        app.routes = fresh_routes(&app.status);
+        app.routes = fresh_routes_for(&selected_device(&app).unwrap());
         let route = headphone_route(RoutingSource::CueB);
 
         let _send = update(&mut app, Message::RouteSelected(route));
@@ -1684,7 +1741,7 @@ mod tests {
     fn reset_sends_the_documented_default() {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
-        app.routes = fresh_routes(&app.status);
+        app.routes = fresh_routes_for(&selected_device(&app).unwrap());
         let destination = RoutingDestination::Outputs3And4;
 
         let _send = update(&mut app, Message::RouteReset(destination));
@@ -1918,7 +1975,7 @@ mod tests {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
         app.channels = fresh_ready_channels();
-        app.meters = fresh_meters(&app.status);
+        app.meters = fresh_meters_for(&selected_device(&app).unwrap());
         assert_eq!(app.speaker.status(), VolumeStatus::Unknown);
 
         let _done = update(
@@ -1990,7 +2047,7 @@ mod tests {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
         app.channels = fresh_ready_channels();
-        app.meters = fresh_meters(&app.status);
+        app.meters = fresh_meters_for(&selected_device(&app).unwrap());
 
         let _confirmed = update(
             &mut app,
@@ -2055,7 +2112,7 @@ mod tests {
         let (mut app, _startup) = App::new();
         app.status = DeviceStatus::Ready(report_with_control());
         app.channels = fresh_ready_channels();
-        app.meters = fresh_meters(&app.status);
+        app.meters = fresh_meters_for(&selected_device(&app).unwrap());
 
         let _confirmed = update(
             &mut app,
@@ -2081,6 +2138,38 @@ mod tests {
         assert!(app.meters.is_empty());
         assert!(app.feedback_notice.is_none());
         assert!(!app.feedback_in_flight);
+    }
+
+    #[test]
+    fn second_device_can_be_selected_explicitly() {
+        let (mut app, _startup) = App::new();
+        let mk = |addr: u8| DetectedDevice {
+            location: DeviceLocation {
+                bus: "3".to_owned(),
+                address: addr,
+            },
+            model: crate::device::supported_device(0x0008).unwrap(),
+            reported_name: None,
+            control_interface: Some(ControlInterface {
+                number: 4,
+                kind: ControlInterfaceKind::ApplicationSpecific,
+            }),
+        };
+        app.status = DeviceStatus::Ready(DiscoveryReport {
+            supported: vec![mk(16), mk(17)],
+            unsupported: vec![],
+        });
+        app.selected = None;
+        let first = selected_device(&app).unwrap().location.address;
+        assert_eq!(first, 16);
+        let _pick = update(
+            &mut app,
+            Message::DeviceSelected(DeviceLocation {
+                bus: "3".to_owned(),
+                address: 17,
+            }),
+        );
+        assert_eq!(selected_device(&app).unwrap().location.address, 17);
     }
 
     fn feedback_ok(monitor: MonitorSnapshot, meters: Option<Vec<u8>>) -> FeedbackOutcome {
