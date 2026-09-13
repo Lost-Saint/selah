@@ -2172,6 +2172,50 @@ mod tests {
         assert_eq!(selected_device(&app).unwrap().location.address, 17);
     }
 
+    #[test]
+    fn picked_model_drives_channel_and_meter_counts() {
+        let (mut app, _startup) = App::new();
+        let mk = |product_id: u16, address: u8| DetectedDevice {
+            location: DeviceLocation {
+                bus: "3".to_owned(),
+                address,
+            },
+            model: crate::device::supported_device(product_id).unwrap(),
+            reported_name: None,
+            control_interface: Some(ControlInterface {
+                number: 4,
+                kind: ControlInterfaceKind::ApplicationSpecific,
+            }),
+        };
+        let report = || DiscoveryReport {
+            supported: vec![mk(0x0008, 16), mk(0x0003, 17)],
+            unsupported: vec![],
+        };
+        let first_model = crate::device::supported_device(0x0008).unwrap();
+        let second_model = crate::device::supported_device(0x0003).unwrap();
+        let first_strips = crate::mixer::mixer_channel_count(first_model) as usize;
+        let first_meters = crate::mixer::meter_channel_count(first_model) as usize;
+        let second_strips = crate::mixer::mixer_channel_count(second_model) as usize;
+        let second_meters = crate::mixer::meter_channel_count(second_model) as usize;
+        assert_ne!(first_strips, second_strips);
+
+        let _found = update(&mut app, Message::DiscoveryFinished(Ok(report())));
+        assert_eq!(selected_device(&app).unwrap().location.address, 16);
+        assert_eq!(app.channels.len(), first_strips);
+        assert_eq!(app.meters.len(), first_meters);
+
+        let _pick = update(
+            &mut app,
+            Message::DeviceSelected(DeviceLocation {
+                bus: "3".to_owned(),
+                address: 17,
+            }),
+        );
+        assert_eq!(selected_device(&app).unwrap().location.address, 17);
+        assert_eq!(app.channels.len(), second_strips);
+        assert_eq!(app.meters.len(), second_meters);
+    }
+
     fn feedback_ok(monitor: MonitorSnapshot, meters: Option<Vec<u8>>) -> FeedbackOutcome {
         FeedbackOutcome {
             location: report_location(),
