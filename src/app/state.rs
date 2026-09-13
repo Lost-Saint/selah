@@ -10,11 +10,15 @@ pub(crate) struct App {
     pub(crate) rescan_requested: bool,
     pub(crate) watch_status: WatchStatus,
     pub(crate) speaker: VolumeControl,
-    pub(crate) headphone: VolumeControl,
     pub(crate) routes: Vec<OutputRouteControl>,
     pub(crate) digital_output_mode: ToggleControl,
     pub(crate) toggles: [ToggleControl; 5],
     pub(crate) channels: Vec<ChannelStrip>,
+    /// Which input groups the mixer bank shows. `MIC` covers microphone
+    /// inputs, `OPT` covers digital/optical inputs. `DAW` returns have no
+    /// mapped strips, so the DAW segment stays an honest disabled indicator.
+    /// View-only: it filters strips, never sends USB.
+    pub(crate) input_filter: InputFilter,
     /// One level byte per mixer input while meters are supported, `None`
     /// per input while the level is unknown. Unknown is never shown as zero.
     pub(crate) meters: Vec<Option<u8>>,
@@ -54,10 +58,10 @@ impl App {
                 rescan_requested: false,
                 watch_status: WatchStatus::Starting,
                 speaker: VolumeControl::default(),
-                headphone: VolumeControl::default(),
                 routes: Vec::new(),
                 digital_output_mode: ToggleControl::default(),
                 toggles: Default::default(),
+                input_filter: InputFilter::default(),
                 channels: Vec::new(),
                 meters: Vec::new(),
                 feedback_in_flight: false,
@@ -66,6 +70,64 @@ impl App {
             },
             iced::Task::none(),
         )
+    }
+}
+
+/// Which input group a mixer strip belongs to, matching the Audient
+/// application's `MIC / OPT / DAW` selector grouping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputGroup {
+    Mic,
+    Optical,
+}
+
+/// View-only filter for the mixer bank. Both groups default to visible;
+/// `DAW` has no mapped strips so it is not a toggleable group.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputFilter {
+    pub(crate) mic: bool,
+    pub(crate) optical: bool,
+}
+
+impl Default for InputFilter {
+    fn default() -> Self {
+        Self {
+            mic: true,
+            optical: true,
+        }
+    }
+}
+
+impl InputFilter {
+    /// Whether the strip at a running channel index stays visible.
+    /// `mic_inputs` is the count of microphone inputs on the model; every
+    /// higher index is a digital/optical input.
+    #[must_use]
+    pub(crate) fn shows(self, channel: u8, mic_inputs: u8) -> bool {
+        if channel < mic_inputs {
+            self.mic
+        } else {
+            self.optical
+        }
+    }
+
+    /// Flips one group's visibility. The last visible group stays on so the
+    /// mixer cannot be filtered into a mode that hides every strip.
+    pub(crate) fn toggle(&mut self, group: InputGroup) {
+        match group {
+            InputGroup::Mic => {
+                if self.mic && !self.optical {
+                    return;
+                }
+                self.mic = !self.mic;
+            }
+            InputGroup::Optical => {
+                if self.optical && !self.mic {
+                    return;
+                }
+                self.optical = !self.optical;
+            }
+        }
     }
 }
 
@@ -110,4 +172,39 @@ pub(crate) fn fresh_meters_for(device: &DetectedDevice) -> Vec<Option<u8>> {
 /// Construction of routing state from the selected model's capabilities.
 pub(crate) fn fresh_routes_for(device: &DetectedDevice) -> Vec<OutputRouteControl> {
     route_controls(device.model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputFilter, InputGroup};
+
+    #[test]
+    fn both_groups_are_visible_by_default() {
+        let filter = InputFilter::default();
+        // iD14 MKII shape: 2 microphones, rest digital.
+        assert!(filter.shows(0, 2));
+        assert!(filter.shows(1, 2));
+        assert!(filter.shows(2, 2));
+        assert!(filter.shows(9, 2));
+    }
+
+    #[test]
+    fn toggling_hides_one_group_at_a_time() {
+        let mut filter = InputFilter::default();
+        filter.toggle(InputGroup::Mic);
+        assert!(!filter.shows(0, 2));
+        assert!(!filter.shows(1, 2));
+        assert!(filter.shows(2, 2));
+
+        filter.toggle(InputGroup::Optical);
+        // Optical was on while mic was off: turning it off would hide every
+        // strip, so the toggle refuses and the bank never goes fully blank
+        // from the filter alone.
+        assert!(filter.shows(2, 2));
+
+        filter.toggle(InputGroup::Mic);
+        filter.toggle(InputGroup::Optical);
+        assert!(filter.shows(0, 2));
+        assert!(!filter.shows(2, 2));
+    }
 }

@@ -4,20 +4,19 @@ use crate::device::{DeviceWatchEvent, MonitorToggle};
 use crate::mixer::ChannelStrip;
 use crate::monitor::{ToggleControl, VolumeControl};
 use crate::routing::{
-    DigitalOutputMode, OutputRouteControl, Route, RoutingDestination,
+    DigitalOutputMode, OutputRouteControl, Route, RouteStatus, RoutingDestination,
     digital_output_mode_available, reset_route,
 };
 
 use super::message::{
     ChannelLevelOutcome, ChannelPolarityOutcome, DigitalOutputModeOutcome, FeedbackOutcome,
-    HeadphoneVolumeOutcome, Message, MonitorToggleOutcome, RoutingOutcome, SpeakerVolumeOutcome,
+    Message, MonitorToggleOutcome, RoutingOutcome, SpeakerVolumeOutcome,
 };
 use super::state::{App, DeviceStatus, WatchStatus, selected_device, toggle_index};
 use super::subscription::{feedback_cadence_ms, monitor_due};
 use super::tasks::{
     adopt_selection, channel_level_task, channel_polarity_task, digital_output_mode_task,
-    finish_scan, headphone_task, monitor_toggle_task, refresh_task, request_scan, routing_task,
-    volume_task,
+    finish_scan, monitor_toggle_task, refresh_task, request_scan, routing_task, volume_task,
 };
 
 pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -52,7 +51,6 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Unsupported(report);
             app.selected = None;
             app.speaker = VolumeControl::default();
-            app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
@@ -67,7 +65,6 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Empty;
             app.selected = None;
             app.speaker = VolumeControl::default();
-            app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
@@ -82,7 +79,6 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             app.status = DeviceStatus::Failed(error);
             app.selected = None;
             app.speaker = VolumeControl::default();
-            app.headphone = VolumeControl::default();
             app.toggles = Default::default();
             app.routes = Vec::new();
             app.digital_output_mode = ToggleControl::default();
@@ -94,8 +90,10 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SpeakerVolumeChanged(level) => request_speaker_volume(app, level),
         Message::SpeakerVolumeFinished(outcome) => finish_speaker_volume(app, outcome),
-        Message::HeadphoneVolumeChanged(level) => request_headphone_volume(app, level),
-        Message::HeadphoneVolumeFinished(outcome) => finish_headphone_volume(app, outcome),
+        Message::InputFilterChanged(group) => {
+            app.input_filter.toggle(group);
+            Task::none()
+        }
         Message::RouteSelected(route) => request_routing(app, route),
         Message::RouteReset(destination) => request_route_reset(app, destination),
         Message::RoutingFinished(outcome) => finish_routing(app, outcome),
@@ -272,45 +270,6 @@ fn finish_speaker_volume(app: &mut App, outcome: SpeakerVolumeOutcome) -> Task<M
     }
 }
 
-/// Starts a background headphone-volume send, queuing when one is in flight.
-///
-/// The USB work runs in the returned task, away from Iced's UI thread.
-fn request_headphone_volume(app: &mut App, level: f32) -> Task<Message> {
-    let Some(device) = selected_device(app) else {
-        return Task::none();
-    };
-
-    match app.headphone.request(level) {
-        Some(send) => headphone_task(device, send),
-        None => Task::none(),
-    }
-}
-
-/// Records a background send result and starts the queued level, if any.
-fn finish_headphone_volume(app: &mut App, outcome: HeadphoneVolumeOutcome) -> Task<Message> {
-    let HeadphoneVolumeOutcome { level, result } = outcome;
-    if !app.headphone.is_in_flight(level) {
-        return Task::none();
-    }
-
-    match &result {
-        Ok(()) => tracing::info!(level, "Headphone volume sent"),
-        Err(error) => tracing::warn!(level, %error, "Headphone volume send failed"),
-    }
-
-    match app.headphone.finish(level, result) {
-        Some(next) => {
-            if let Some(device) = selected_device(app) {
-                headphone_task(device, next)
-            } else {
-                app.headphone.drop_pending();
-                Task::none()
-            }
-        }
-        None => Task::none(),
-    }
-}
-
 fn route_control(
     app: &mut App,
     destination: RoutingDestination,
@@ -330,6 +289,13 @@ fn request_routing(app: &mut App, route: Route) -> Task<Message> {
     let Some(output) = route_control(app, route.destination) else {
         return Task::none();
     };
+    // Re-selecting the dropdown's current value is a no-op, unless the last
+    // send failed and the same choice is an explicit retry.
+    if output.control.requested() == Some(route.source)
+        && !matches!(output.control.status(), RouteStatus::Failed { .. })
+    {
+        return Task::none();
+    }
 
     match output.control.request(route.source) {
         Some(_) => routing_task(device, route),
@@ -579,12 +545,9 @@ mod tests {
         let (mut app, _startup) = App::new();
 
         let _ignored = update(&mut app, Message::SpeakerVolumeChanged(0.5));
-        let _also_ignored = update(&mut app, Message::HeadphoneVolumeChanged(0.5));
 
         assert_level_eq(app.speaker.position(), 0.0);
         assert_eq!(app.speaker.status(), VolumeStatus::Unknown);
-        assert_level_eq(app.headphone.position(), 0.0);
-        assert_eq!(app.headphone.status(), VolumeStatus::Unknown);
     }
 
     #[test]
@@ -718,6 +681,61 @@ mod tests {
                 .status(),
             RouteStatus::Sent {
                 source: route.source
+            }
+        );
+    }
+
+    #[test]
+    fn reselecting_the_current_source_is_a_no_op_unless_it_failed() {
+        let (mut app, _startup) = App::new();
+        app.status = DeviceStatus::Ready(report_with_control());
+        app.routes = fresh_routes_for(&selected_device(&app).unwrap());
+        let route = headphone_route(RoutingSource::MainMix);
+
+        let _send = update(&mut app, Message::RouteSelected(route));
+        let _done = update(
+            &mut app,
+            Message::RoutingFinished(RoutingOutcome {
+                route,
+                result: Ok(()),
+            }),
+        );
+
+        // Dropdown re-selection of the accepted value sends nothing new.
+        let _reselect = update(&mut app, Message::RouteSelected(route));
+        assert_eq!(
+            route_control(&mut app, route.destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Sent {
+                source: route.source
+            }
+        );
+
+        // But the same choice after a failure is an explicit retry.
+        let _failed = update(
+            &mut app,
+            Message::RouteSelected(headphone_route(RoutingSource::CueB)),
+        );
+        let _failed_done = update(
+            &mut app,
+            Message::RoutingFinished(RoutingOutcome {
+                route: headphone_route(RoutingSource::CueB),
+                result: Err("no device".to_owned()),
+            }),
+        );
+        let _retry = update(
+            &mut app,
+            Message::RouteSelected(headphone_route(RoutingSource::CueB)),
+        );
+        assert_eq!(
+            route_control(&mut app, route.destination)
+                .unwrap()
+                .control
+                .status(),
+            RouteStatus::Sending {
+                source: RoutingSource::CueB
             }
         );
     }

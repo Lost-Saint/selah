@@ -32,6 +32,12 @@ impl RoutingSource {
     }
 }
 
+impl Display for RoutingSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// One channel in an eight-channel ADAT stream, numbered as users see it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdatChannel(u8);
@@ -491,6 +497,13 @@ mod tests {
         ));
         assert!(AdatChannel::new(0).is_none());
         assert!(AdatChannel::new(9).is_none());
+    }
+
+    #[test]
+    fn source_display_matches_the_dropdown_label() {
+        assert_eq!(RoutingSource::MainMix.to_string(), "Main Mix");
+        assert_eq!(RoutingSource::CueA.to_string(), "Cue A");
+        assert_eq!(RoutingSource::DawMix.to_string(), "DAW Mix");
     }
 
     #[test]

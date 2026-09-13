@@ -12,7 +12,9 @@ Selah should eventually provide:
 
 - automatic discovery of supported Audient iD interfaces;
 - mixer controls shaped by the connected model's real capabilities;
-- monitor, headphone, channel, and routing controls;
+- monitor, channel, and routing controls (headphone routing included; there is
+  deliberately no headphone volume slider — the official application exposes
+  none);
 - trustworthy device feedback and level metering where the protocol allows it;
 - safe disconnect and recovery behavior;
 - installation packages with narrowly scoped USB permissions;
@@ -69,7 +71,9 @@ The app sends monitor, mixer, and capability-gated routing controls through back
 **Outcome:** one verified model can perform the daily monitor operations already available in MixiD.
 
 - Main speaker volume. ✅
-- Headphone volume. ✅
+- Headphone volume mapping. ✅ at transfer level (no UI slider: the official
+  application exposes no in-app headphone gain, and the mapping is write-only;
+  see `docs/protocol.md`)
 - Dim, mute, mono, alternate-speaker, and talkback controls where supported. ✅ (iD14 MKII gate; per-model differences unverified)
 - Honest pending, applied, failed, and unknown states for each control. ✅
 - Capability-driven UI that hides controls a model does not have. ✅
@@ -143,13 +147,62 @@ MixiD does not yet provide complete state readback, so Selah must not present a 
 
 **Exit condition:** a user on a documented supported distribution can install Selah, complete the mixer workflow on a verified model, update it, and remove it cleanly.
 
+## Audient-verified iD Mixer backlog
+
+The features below are documented Audient iD Mixer functionality, confirmed
+against Audient's Help Desk on 2026-09-13 ("What do Main, Cue and DAW Thru
+do?" and "ID14 Loop-back Setup").
+That confirms what the official mixer *does* — it is documentation evidence,
+not USB-mapping evidence. A backlog item becomes milestone work only when its
+USB mapping is evidenced from MixiD, BiD, hardware capture, or Selah's own
+listening tests; Audient docs alone never enable a write, and per-model
+differences (iD4 through iD44) each need their own mapping.
+
+Already in Selah (reference-derived or verified, model-gated as noted):
+
+- analogue (mic/line/DI) and digital (optical ADAT/S/PDIF) input channels
+  with faders, meters, and polarity;
+- Main Mix, Cue A/B, and DAW Mix/DAW Thru routing to physical outputs, with
+  reset-to-documented-default instead of an invented off state;
+- talkback, mono, dim, mute, and alternate-speaker monitor toggles on the
+  iD14 MKII gate;
+- channel visibility for analogue and digital groups (DAW returns unmapped).
+
+Needs a USB mapping before any control is shown:
+
+- per-channel mute, solo, and pan;
+- stereo linking of adjacent channels;
+- mix-specific faders, cue master level, cue solo, and main/cue meters;
+- monitor cut and adjustable dim level;
+- DAW return channels as mixer strips;
+- talkback source selection (input or computer audio device, per interface);
+- loopback source selection (iD14 MKII sources are documented as DAW 1+2,
+  3+4, 5+6, Master Mix, Cue A, Cue B; the original iD14 MKI has no loopback
+  hardware);
+- mixer presets: save, load, export, and import;
+- channel renaming.
+
+App-side work needing no USB mapping:
+
+- keyboard shortcuts beyond the current focusable buttons and 0.01 slider
+  steps;
+- ScrollControl-style encoder behavior where the hardware supports it.
+
+Explicitly not iD Mixer features — Selah will not invent them:
+
+- built-in channel EQ, compressor, reverb, delay, or noise gate;
+- arbitrary VST/plugin hosting inside the mixer.
+
+(Audient's reverb-tracking documentation describes DAW plugins, not mixer
+DSP.)
+
 ## Beyond MixiD parity
 
-These are candidates after the core iD experience is reliable:
+These are candidates after the core iD experience is reliable (mixer presets
+and configuration import/export now live in the backlog above with their
+evidence gates):
 
-- named mixer snapshots and safe A/B recall;
 - per-model default layouts;
-- import and export of non-sensitive configuration;
 - opt-in system tray controls;
 - richer diagnostics and a guided hardware-verification report;
 - support for additional Audient families.

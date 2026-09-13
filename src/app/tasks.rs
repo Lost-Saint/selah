@@ -2,15 +2,15 @@ use iced::Task;
 
 use crate::device::{
     DetectedDevice, MonitorToggle, discover, read_feedback, send_channel_level,
-    send_channel_polarity, send_digital_output_mode, send_headphone_level, send_monitor_toggle,
-    send_output_route, send_speaker_level,
+    send_channel_polarity, send_digital_output_mode, send_monitor_toggle, send_output_route,
+    send_speaker_level,
 };
 use crate::monitor::{ToggleControl, VolumeControl};
 use crate::routing::{DigitalOutputMode, Route};
 
 use super::message::{
     ChannelLevelOutcome, ChannelPolarityOutcome, DigitalOutputModeOutcome, FeedbackOutcome,
-    HeadphoneVolumeOutcome, Message, MonitorToggleOutcome, RoutingOutcome, SpeakerVolumeOutcome,
+    Message, MonitorToggleOutcome, RoutingOutcome, SpeakerVolumeOutcome,
 };
 use super::state::{
     App, DeviceStatus, fresh_channels_for, fresh_meters_for, fresh_routes_for, selected_device,
@@ -23,7 +23,6 @@ use super::subscription::feedback_cadence;
 pub(crate) fn adopt_selection(app: &mut App) -> Task<Message> {
     let selected = selected_device(app);
     app.speaker = VolumeControl::default();
-    app.headphone = VolumeControl::default();
     app.toggles = Default::default();
     app.routes = selected.as_ref().map(fresh_routes_for).unwrap_or_default();
     app.digital_output_mode = ToggleControl::default();
@@ -98,18 +97,6 @@ pub(crate) fn volume_task(device: DetectedDevice, level: f32) -> Task<Message> {
             }
         },
         Message::SpeakerVolumeFinished,
-    )
-}
-
-pub(crate) fn headphone_task(device: DetectedDevice, level: f32) -> Task<Message> {
-    Task::perform(
-        async move {
-            HeadphoneVolumeOutcome {
-                level,
-                result: send_headphone_level(device, level).await,
-            }
-        },
-        Message::HeadphoneVolumeFinished,
     )
 }
 

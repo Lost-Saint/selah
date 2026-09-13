@@ -4,18 +4,12 @@ use crate::device::{
 };
 use crate::routing::{DigitalOutputMode, Route, RoutingDestination};
 
+use super::state::InputGroup;
+
 /// Outcome of one background speaker-volume send, paired with the level it
 /// attempted so stale completions can be ignored after a rescan.
 #[derive(Clone, Debug)]
 pub(crate) struct SpeakerVolumeOutcome {
-    pub(crate) level: f32,
-    pub(crate) result: Result<(), String>,
-}
-
-/// Outcome of one background headphone-volume send, paired with the level
-/// it attempted so stale completions can be ignored after a rescan.
-#[derive(Clone, Debug)]
-pub(crate) struct HeadphoneVolumeOutcome {
     pub(crate) level: f32,
     pub(crate) result: Result<(), String>,
 }
@@ -78,8 +72,7 @@ pub(crate) enum Message {
     DiscoveryFinished(Result<DiscoveryReport, DiscoveryError>),
     SpeakerVolumeChanged(f32),
     SpeakerVolumeFinished(SpeakerVolumeOutcome),
-    HeadphoneVolumeChanged(f32),
-    HeadphoneVolumeFinished(HeadphoneVolumeOutcome),
+    InputFilterChanged(InputGroup),
     RouteSelected(Route),
     RouteReset(RoutingDestination),
     RoutingFinished(RoutingOutcome),

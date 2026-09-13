@@ -233,12 +233,13 @@ impl VolumeControl {
     }
 }
 
-/// Whether monitor volume controls can be offered for this attachment.
+/// Whether the speaker volume control can be offered for this attachment.
 ///
-/// Every cataloged model exposes speaker and headphone volume through the
-/// same safe control interface, so availability is purely "a session can be
-/// opened". Per-model control differences are unverified; do not add
-/// per-model booleans without hardware evidence.
+/// Gated on a session being openable. The UI intentionally exposes only the
+/// speaker control: the official application offers no in-app headphone
+/// gain, and the reference headphone mapping stays write-only and inaudible
+/// on cue-fed phones outputs. Headphone sends remain available in the
+/// transport for future evidence, but no slider is shown for them.
 #[must_use]
 pub fn monitor_controls_available(device: &DetectedDevice) -> bool {
     device.control_interface.is_some()

@@ -25,6 +25,10 @@ pub async fn send_speaker_level(device: DetectedDevice, level: f32) -> Result<()
 
 /// Sends the bounded headphone volume requests and always closes the session.
 ///
+/// Retained for protocol evidence and opt-in hardware checks; the UI
+/// intentionally exposes no headphone slider (the official application has
+/// none, and the mapping is write-only and inaudible on cue-fed outputs).
+///
 /// # Errors
 ///
 /// Returns a message with a recovery hint when validation, opening, sending,

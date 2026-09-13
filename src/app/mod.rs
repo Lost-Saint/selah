@@ -12,7 +12,7 @@ pub(crate) fn run() -> iced::Result {
         .title("Selah")
         .theme(crate::ui::theme)
         .subscription(subscription::subscription)
-        .window_size((760.0, 520.0))
+        .window_size((1080.0, 720.0))
         .centered()
         .run()
 }
