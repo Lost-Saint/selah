@@ -4,6 +4,7 @@ mod catalog;
 mod support;
 pub use support::{SupportLevel, support_label, support_level};
 mod control;
+mod diagnostics;
 mod discovery;
 mod error;
 mod protocol;
@@ -16,6 +17,7 @@ pub use control::{
     send_digital_output_mode, send_headphone_level, send_monitor_toggle, send_output_route,
     send_speaker_level,
 };
+pub use diagnostics::diagnostics_text;
 pub use discovery::{
     DetectedDevice, DeviceLocation, DiscoveryReport, UnknownAudientDevice, discover,
 };

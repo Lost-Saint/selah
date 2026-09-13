@@ -1050,7 +1050,12 @@ fn status_view(app: &App) -> Element<'_, Message> {
         .spacing(14)
         .into(),
         DeviceStatus::Ready(report) => supported_view(app, report),
-        DeviceStatus::Unsupported(report) => unknown_view(&report.unsupported[0]),
+        DeviceStatus::Unsupported(report) => column![
+            unknown_view(&report.unsupported[0]),
+            diagnostics_footer(report),
+        ]
+        .spacing(14)
+        .into(),
         DeviceStatus::Failed(error) => column![
             status_label("Scan failed", container::danger),
             text("Couldn’t scan USB devices").size(24),
@@ -1215,7 +1220,19 @@ fn supported_view<'a>(app: &'a App, report: &'a DiscoveryReport) -> Element<'a, 
         content = content.push(mixer_view(device.model, &app.channels, &app.meters));
     }
 
+    content = content.push(diagnostics_footer(report));
+
     content.into()
+}
+
+/// Copy-safe diagnostics block shared by the Ready and Unsupported views.
+/// No new message or button: users copy via text selection, so no
+/// clipboard dependency is needed.
+fn diagnostics_footer(report: &DiscoveryReport) -> Element<'_, Message> {
+    text(crate::device::diagnostics_text(report))
+        .size(12)
+        .style(text::secondary)
+        .into()
 }
 
 /// One monitor volume slider.
