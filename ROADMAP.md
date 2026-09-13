@@ -103,7 +103,7 @@ MixiD does not yet provide complete state readback, so Selah must not present a 
 - Insert and send/return behavior only after it is verified on capable hardware; see [MixiD issue #5](https://github.com/TheOnlyJoey/MixiD/issues/5). ➖ (no verified mapping; capability remains visibly unavailable and sends nothing)
 - Routing layouts derived from model capabilities rather than fixed six-channel tables. ✅
 
-**Exit condition:** every available source and destination can be selected and reset. ✅ in code and hardware-independent tests. The source mappings are externally hardware-verified on an iD14 MKII and iD24; Selah's own transfers have not yet been physically verified on either model, so the hardware portion of this exit condition remains open.
+**Exit condition:** every available source and destination can be selected and reset. ✅ in code and hardware-independent tests. Source mappings are externally evidenced on iD14 MKII and iD24; Selah's own audible confirmation is best-effort on the maintainer's iD14 MKII and does not block close-out. Unverified models stay cataloged with no routing map exposed.
 
 ## Milestone 5 — Device feedback and metering
 
@@ -115,19 +115,20 @@ MixiD does not yet provide complete state readback, so Selah must not present a 
 - Suspend metering when hidden, disconnected, or unchanged to avoid continuous GPU and USB load. ✅ in code (the timer exists only while a readable device is present; mid-poll ticks are dropped; unchanged values stay quiet — with the note that the current single-window app has no meaningful hidden state to suspend on)
 - Show unavailable feedback as unknown rather than zero. ✅ in code (unknown meters render as a placeholder, never a zero bar; unconfirmed levels never default to `0`, `false`, or the last sent value)
 
-**Exit condition:** UI values survive reconnect accurately when the device supports readback, and metering remains responsive without busy polling or continuous repainting. ✅ in code and hardware-independent tests, with transfer-level hardware evidence on an iD14 MKII (monitor roundtrip, meter block, warning-free GUI session). Open: meter level accuracy against a known signal, audible confirmation, and the Milestone 4 Selah-transfer verification above.
+**Exit condition:** UI values survive reconnect accurately when the device supports readback, and metering remains responsive without busy polling or continuous repainting. ✅ in code and hardware-independent tests, with transfer-level evidence on an iD14 MKII (monitor roundtrip, meter block, warning-free GUI session). Meter accuracy against a known signal and audible confirmation are best-effort follow-ups recorded in `docs/protocol.md`, not close-out blockers.
 
 ## Milestone 6 — Broad iD verification
 
-**Outcome:** support claims are backed by a maintained compatibility matrix rather than inferred from similar devices.
+**Outcome:** support claims are backed by a maintained compatibility matrix rather than inferred from similar devices. The maintainer verifies on an iD14 MKII only; every other model depends on community-provided hardware results.
 
-- Verify every cataloged model with community-provided hardware results.
+- Verify the iD14 MKII as the primary target with maintainer hardware results.
+- Accept community results for every other cataloged model; unverified models stay cataloged with unavailable controls hidden, never claimed as supported.
 - Record working controls, firmware information, limitations, and regressions per model.
 - Resolve model-specific counts and mappings, including ongoing iD48 investigation in [MixiD issue #1](https://github.com/TheOnlyJoey/MixiD/issues/1).
 - Handle multiple connected Audient interfaces explicitly.
 - Provide useful diagnostics that users can share without exposing serial numbers or full USB captures.
 
-**Exit condition:** each advertised model has a published verification record, and partially supported models are labeled precisely.
+**Exit condition:** the iD14 MKII has a published verification record; each additional advertised model gains one only after its own hardware result, and partially supported models are labeled precisely.
 
 ## Milestone 7 — Daily-driver release
 
@@ -157,6 +158,6 @@ EVO support is explicitly out of scope until the iD protocol and product experie
 
 ## Immediate goal
 
-The current target is **hardware verification for Milestones 4 and 5**: the Selah-specific routing-transfer checks on compact and digitally expanded devices, plus the first readback and meter-block probes (`reads_monitor_volume_harmlessly`, `probes_meter_block_harmlessly`) on a named model with its firmware version recorded.
+The current target is **Milestone 6 on a single-device budget**: keep the iD14 MKII as the verified primary, keep every other model cataloged-but-unverified with unavailable controls hidden, and grow the compatibility matrix only from community hardware results. Audible and meter-accuracy checks on the iD14 MKII are best-effort and recorded in `docs/protocol.md` when they happen.
 
 Roadmap priorities may change when hardware evidence disproves an assumption. Safety, honest state, and normal audio continuity take priority over feature count.
